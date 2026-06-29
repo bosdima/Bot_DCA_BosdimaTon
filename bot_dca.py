@@ -2,11 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.15.1 (29.06.2026)
-ИСПРАВЛЕНИЯ:
-- Исправлена ошибка подписи API Bybit (ErrCode: 10004)
-- Исправлена обработка Markdown в Telegram сообщениях
-- Улучшена обработка ошибок API
+Версия 6.0.0 (29.06.2026)
+УЛУЧШЕНИЯ:
+- Разделение ответственности (UI / Бизнес-логика / Данные)
+- Thread-safe работа с БД
+- Health check и мониторинг
+- Rate limiting для API
+- Graceful shutdown с сохранением состояния
+- Улучшенная обработка ошибок
+- PID файл для предотвращения дублирования
 """
 
 import os
@@ -18,9 +22,10 @@ import sqlite3
 import re
 import time
 import math
+import signal
+from contextlib import contextmanager
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from colorama import init, Fore, Style
 from logging.handlers import RotatingFileHandler
 
@@ -51,10 +56,18 @@ if sys.platform == 'win32':
 init(autoreset=True)
 load_dotenv()
 
-# ============ НАСТРОЙКИ ТОКЕНОВ ============
+# ============ НАСТРОЙКИ ============
 DEFAULT_SYMBOL = "ETHUSDT"
 POPULAR_SYMBOLS = ["ETHUSDT", "GRAMUSDT", "XRPUSDT", "BTCUSDT"]
-# ===========================================
+BOT_VERSION = "6.0.0 (29.06.2026)"
+CONVERSATION_TIMEOUT = 180
+MIN_ORDER_AMOUNT = 5.0
+SELL_DECIMALS_FALLBACK = 5
+MAX_DROP_DEPTH = 80
+DB_EXPORT_FILE = 'dca_data_export.json'
+PID_FILE = 'bot.pid'
+STATE_FILE = 'bot_state.json'
+# ===================================
 
 # Настройка логов с ротацией
 log_handler = RotatingFileHandler("bot_errors.log", encoding='utf-8', maxBytes=200*1024, backupCount=2)
@@ -73,12 +86,9 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.15.1 (29.06.2026)"
-CONVERSATION_TIMEOUT = 180
-MIN_ORDER_AMOUNT = 5.0
-SELL_DECIMALS_FALLBACK = 5
-
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+
+# ============ УТИЛИТЫ ============
 
 def get_moscow_time() -> datetime:
     return datetime.now(MOSCOW_TZ)
@@ -92,7 +102,64 @@ def get_api_keys():
     api_secret = os.getenv('BYBIT_API_SECRET')
     return api_key, api_secret
 
-# Состояния
+def format_price(price: float, decimals: int = 4) -> str:
+    if price is None: return "N/A"
+    return f"{price:.{decimals}f}"
+
+def format_quantity(qty: float, decimals: int = 5) -> str:
+    if qty is None: return "N/A"
+    return f"{qty:.{decimals}f}"
+
+def round_price_up(price: float) -> float:
+    return math.ceil(price * 100) / 100
+
+def safe_parse_date(date_str: str, format_in: str = "%Y-%m-%d %H:%M:%S", format_out: str = "%d.%m.%Y %H:%M") -> str:
+    if not date_str:
+        return "N/A"
+    try:
+        return datetime.strptime(date_str, format_in).strftime(format_out)
+    except (ValueError, TypeError):
+        return date_str[:16] if len(date_str) > 10 else date_str
+
+def calculate_current_drop(current_price: float, avg_price: float) -> float:
+    if avg_price <= 0: return 0
+    drop = ((avg_price - current_price) / avg_price) * 100
+    return max(0, drop)
+
+def calculate_apy(profit_usdt: float, total_invested: float, days: int) -> float:
+    if days <= 0 or total_invested <= 0:
+        return 0.0
+    return (profit_usdt / total_invested) * (365 / days) * 100
+
+def format_time_remaining(seconds: int) -> str:
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours}ч {minutes}м {secs}с"
+    elif minutes > 0:
+        return f"{minutes}м {secs}с"
+    else:
+        return f"{secs}с"
+
+def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) -> Tuple[int, float]:
+    if drop_percent <= 0: return 0, 0.0
+    effective_drop = min(drop_percent, max_depth)
+    ratio = (effective_drop / max_depth) * 3.0
+    ratio = min(ratio, 3.0)
+    level = int(effective_drop)
+    return level, ratio
+
+def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
+    if drop_percent <= 0:
+        return base_amount
+    effective_drop = min(drop_percent, max_depth)
+    fraction = effective_drop / max_depth
+    amount = base_amount + (max_amount - base_amount) * fraction
+    return min(amount, max_amount)
+
+
+# ============ СОСТОЯНИЯ ============
 (
     SELECTING_ACTION,
     SET_SYMBOL,
@@ -130,10 +197,8 @@ def get_api_keys():
     WAITING_PURCHASE_NOTIFY_TIME,
     AUTO_DCA_SETTINGS,
     SET_MANUAL_AMOUNT,
-) = range(36)
-
-DB_EXPORT_FILE = 'dca_data_export.json'
-MAX_DROP_DEPTH = 80
+    HEALTH_CHECK_MENU,
+) = range(37)
 
 MAIN_MENU_BUTTONS = [
     "📊 Мой Портфель", "🚀 Запустить Авто DCA", "⏹ Остановить Авто DCA",
@@ -144,216 +209,170 @@ MAIN_MENU_BUTTONS = [
     "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку", "❌ Отмена"
 ]
 
-async def safe_send_message(bot, chat_id, text, parse_mode=None, reply_markup=None, **kwargs):
-    try:
-        if parse_mode:
-            return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup, **kwargs)
-        else:
-            return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, **kwargs)
-    except Exception as e:
-        if "Can't parse entities" in str(e) or "Bad Request" in str(e):
-            logger.warning(f"Markdown parse error, sending without formatting: {e}")
-            clean_text = text.replace('*', '').replace('`', '').replace('_', '')
-            return await bot.send_message(chat_id=chat_id, text=clean_text, reply_markup=reply_markup)
-        else:
-            raise e
+# ============ RATE LIMITER ============
 
-def format_price(price: float, decimals: int = 4) -> str:
-    if price is None: return "N/A"
-    return f"{price:.{decimals}f}"
+class RateLimiter:
+    """Rate limiter для API запросов"""
+    def __init__(self, max_calls: int = 30, period: float = 60.0):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls: List[float] = []
+        self._lock = asyncio.Lock()
+    
+    async def __aenter__(self):
+        async with self._lock:
+            now = time.time()
+            self.calls = [t for t in self.calls if t > now - self.period]
+            if len(self.calls) >= self.max_calls:
+                wait_time = self.period - (now - self.calls[0])
+                if wait_time > 0:
+                    logger.warning(f"Rate limit reached, waiting {wait_time:.1f}s")
+                    await asyncio.sleep(wait_time)
+            self.calls.append(now)
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
 
-def format_quantity(qty: float, decimals: int = 5) -> str:
-    if qty is None: return "N/A"
-    return f"{qty:.{decimals}f}"
 
-def round_price_up(price: float) -> float:
-    return math.ceil(price * 100) / 100
-
-def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) -> Tuple[int, float]:
-    if drop_percent <= 0: return 0, 0.0
-    effective_drop = min(drop_percent, max_depth)
-    ratio = (effective_drop / max_depth) * 3.0
-    ratio = min(ratio, 3.0)
-    level = int(effective_drop)
-    return level, ratio
-
-def get_amount_by_drop(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
-    if drop_percent <= 0:
-        return base_amount
-    effective_drop = min(drop_percent, max_depth)
-    fraction = effective_drop / max_depth
-    amount = base_amount + (max_amount - base_amount) * fraction
-    return min(amount, max_amount)
-
-def calculate_current_drop(current_price: float, avg_price: float) -> float:
-    if avg_price <= 0: return 0
-    drop = ((avg_price - current_price) / avg_price) * 100
-    return max(0, drop)
-
-def calculate_apy(profit_usdt: float, total_invested: float, days: int) -> float:
-    if days <= 0 or total_invested <= 0:
-        return 0.0
-    return (profit_usdt / total_invested) * (365 / days) * 100
-
-def format_time_remaining(seconds: int) -> str:
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-    if hours > 0:
-        return f"{hours}ч {minutes}м {secs}с"
-    elif minutes > 0:
-        return f"{minutes}м {secs}с"
-    else:
-        return f"{secs}с"
-
+# ============ DATABASE ============
 
 class Database:
+    """Thread-safe работа с базой данных"""
     def __init__(self, db_file: str = "dca_bot.db"):
         self.db_file = db_file
+        self._lock = asyncio.Lock()
         self.init_db()
+    
+    @contextmanager
+    def get_connection(self):
+        """Контекстный менеджер для соединения с БД"""
+        conn = sqlite3.connect(self.db_file, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
     
     def init_db(self):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=10)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS dca_purchases (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    amount_usdt REAL NOT NULL,
-                    price REAL NOT NULL,
-                    quantity REAL NOT NULL,
-                    multiplier REAL DEFAULT 1.0,
-                    drop_percent REAL DEFAULT 0,
-                    step_level INTEGER DEFAULT 0,
-                    date TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    order_id TEXT
-                )
-            ''')
-            
-            cursor.execute("PRAGMA table_info(dca_purchases)")
-            columns = [col[1] for col in cursor.fetchall()]
-            if 'order_id' not in columns:
-                cursor.execute("ALTER TABLE dca_purchases ADD COLUMN order_id TEXT")
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS sell_orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    order_id TEXT NOT NULL UNIQUE,
-                    quantity REAL NOT NULL,
-                    target_price REAL NOT NULL,
-                    profit_percent REAL NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT DEFAULT 'active'
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pending_sell_orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    quantity REAL NOT NULL,
-                    target_price REAL NOT NULL,
-                    profit_percent REAL NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT DEFAULT 'pending',
-                    retry_count INTEGER DEFAULT 0,
-                    last_retry TIMESTAMP,
-                    fail_reason TEXT
-                )
-            ''')
-            
-            cursor.execute("PRAGMA table_info(pending_sell_orders)")
-            columns = [col[1] for col in cursor.fetchall()]
-            if 'retry_count' not in columns:
-                cursor.execute("ALTER TABLE pending_sell_orders ADD COLUMN retry_count INTEGER DEFAULT 0")
-            if 'last_retry' not in columns:
-                cursor.execute("ALTER TABLE pending_sell_orders ADD COLUMN last_retry TIMESTAMP")
-            if 'fail_reason' not in columns:
-                cursor.execute("ALTER TABLE pending_sell_orders ADD COLUMN fail_reason TEXT")
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS completed_sells (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    order_id TEXT NOT NULL,
-                    quantity REAL NOT NULL,
-                    sell_price REAL NOT NULL,
-                    profit_percent REAL NOT NULL,
-                    profit_usdt REAL NOT NULL,
-                    sold_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    notified BOOLEAN DEFAULT 0,
-                    stats_cleared BOOLEAN DEFAULT 0,
-                    clear_deadline TIMESTAMP
-                )
-            ''')
-            
-            cursor.execute("PRAGMA table_info(completed_sells)")
-            columns = [col[1] for col in cursor.fetchall()]
-            if 'clear_deadline' not in columns:
-                cursor.execute("ALTER TABLE completed_sells ADD COLUMN clear_deadline TIMESTAMP")
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    action TEXT NOT NULL,
-                    symbol TEXT,
-                    details TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS dca_start (
-                    id INTEGER PRIMARY KEY,
-                    start_date TIMESTAMP,
-                    symbol TEXT,
-                    initial_price REAL
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS notifications (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    enabled BOOLEAN DEFAULT 1,
-                    alert_percent REAL DEFAULT 10.0,
-                    alert_interval_minutes INTEGER DEFAULT 30,
-                    last_check TIMESTAMP
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS ladder_settings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    max_depth REAL NOT NULL,
-                    base_amount REAL NOT NULL,
-                    max_amount REAL NOT NULL,
-                    step_percent REAL DEFAULT 1.0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            cursor.execute("PRAGMA table_info(ladder_settings)")
-            columns = [col[1] for col in cursor.fetchall()]
-            if 'step_percent' not in columns:
-                cursor.execute("ALTER TABLE ladder_settings ADD COLUMN step_percent REAL DEFAULT 1.0")
-            
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='executed_orders'")
-            table_exists = cursor.fetchone()
-            
-            if not table_exists:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS dca_purchases (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        amount_usdt REAL NOT NULL,
+                        price REAL NOT NULL,
+                        quantity REAL NOT NULL,
+                        multiplier REAL DEFAULT 1.0,
+                        drop_percent REAL DEFAULT 0,
+                        step_level INTEGER DEFAULT 0,
+                        date TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        order_id TEXT
+                    )
+                ''')
+                
+                cursor.execute("PRAGMA table_info(dca_purchases)")
+                columns = [col[1] for col in cursor.fetchall()]
+                if 'order_id' not in columns:
+                    cursor.execute("ALTER TABLE dca_purchases ADD COLUMN order_id TEXT")
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS sell_orders (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        order_id TEXT NOT NULL UNIQUE,
+                        quantity REAL NOT NULL,
+                        target_price REAL NOT NULL,
+                        profit_percent REAL NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        status TEXT DEFAULT 'active'
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS pending_sell_orders (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        quantity REAL NOT NULL,
+                        target_price REAL NOT NULL,
+                        profit_percent REAL NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        status TEXT DEFAULT 'pending',
+                        retry_count INTEGER DEFAULT 0,
+                        last_retry TIMESTAMP,
+                        fail_reason TEXT
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS completed_sells (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        order_id TEXT NOT NULL,
+                        quantity REAL NOT NULL,
+                        sell_price REAL NOT NULL,
+                        profit_percent REAL NOT NULL,
+                        profit_usdt REAL NOT NULL,
+                        sold_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        notified BOOLEAN DEFAULT 0,
+                        stats_cleared BOOLEAN DEFAULT 0,
+                        clear_deadline TIMESTAMP
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        action TEXT NOT NULL,
+                        symbol TEXT,
+                        details TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS dca_start (
+                        id INTEGER PRIMARY KEY,
+                        start_date TIMESTAMP,
+                        symbol TEXT,
+                        initial_price REAL
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS notifications (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        enabled BOOLEAN DEFAULT 1,
+                        alert_percent REAL DEFAULT 10.0,
+                        alert_interval_minutes INTEGER DEFAULT 30,
+                        last_check TIMESTAMP
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS ladder_settings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        max_depth REAL NOT NULL,
+                        base_amount REAL NOT NULL,
+                        max_amount REAL NOT NULL,
+                        step_percent REAL DEFAULT 1.0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS executed_orders (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -368,89 +387,77 @@ class Database:
                         notified_at TIMESTAMP
                     )
                 ''')
-            else:
-                cursor.execute("PRAGMA table_info(executed_orders)")
-                columns = [col[1] for col in cursor.fetchall()]
-                if 'skipped' not in columns:
-                    cursor.execute("ALTER TABLE executed_orders ADD COLUMN skipped BOOLEAN DEFAULT 0")
-                if 'notified_at' not in columns:
-                    cursor.execute("ALTER TABLE executed_orders ADD COLUMN notified_at TIMESTAMP")
-                if 'added_to_stats' not in columns:
-                    cursor.execute("ALTER TABLE executed_orders ADD COLUMN added_to_stats BOOLEAN DEFAULT 0")
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            ''')
-            
-            defaults = [
-                ('symbol', DEFAULT_SYMBOL),
-                ('invest_amount', '5.0'),
-                ('manual_amount', '1.1'),
-                ('profit_percent', '5'),
-                ('max_drop_percent', '80'),
-                ('max_multiplier', '3'),
-                ('schedule_time', '05:00'),
-                ('frequency_hours', '24'),
-                ('price_alert_enabled', 'false'),
-                ('dca_active', 'false'),
-                ('last_purchase_price', '0'),
-                ('initial_reference_price', '0'),
-                ('last_purchase_time', '0'),
-                ('ladder_base_amount', '5.0'),
-                ('ladder_max_depth', '80'),
-                ('ladder_max_amount', '15.0'),
-                ('order_execution_notify', 'true'),
-                ('order_check_interval_minutes', '5'),
-                ('sell_tracking_enabled', 'true'),
-                ('purchase_notify_enabled', 'true'),
-                ('purchase_notify_time', '06:00'),
-                ('last_order_check_time', ''),
-                ('last_full_check_time', ''),
-                ('last_sell_check_time', ''),
-                ('last_purchase_notify_date', ''),
-                ('first_order_date', ''),
-                ('next_dca_purchase_time', ''),
-                ('trading_mode', 'real'),
-                ('last_api_check_time', ''),
-                ('api_status', 'unknown'),
-                ('api_error_message', ''),
-            ]
-            
-            for key, value in defaults:
-                cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
-            
-            cursor.execute('''
-                INSERT OR IGNORE INTO notifications (id, enabled, alert_percent, alert_interval_minutes, last_check)
-                VALUES (1, 1, 10.0, 30, CURRENT_TIMESTAMP)
-            ''')
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"Database initialized successfully")
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                ''')
+                
+                defaults = [
+                    ('symbol', DEFAULT_SYMBOL),
+                    ('invest_amount', '5.0'),
+                    ('manual_amount', '1.1'),
+                    ('profit_percent', '5'),
+                    ('max_drop_percent', '80'),
+                    ('max_multiplier', '3'),
+                    ('schedule_time', '05:00'),
+                    ('frequency_hours', '24'),
+                    ('price_alert_enabled', 'false'),
+                    ('dca_active', 'false'),
+                    ('last_purchase_price', '0'),
+                    ('initial_reference_price', '0'),
+                    ('last_purchase_time', '0'),
+                    ('ladder_base_amount', '5.0'),
+                    ('ladder_max_depth', '80'),
+                    ('ladder_max_amount', '15.0'),
+                    ('order_execution_notify', 'true'),
+                    ('order_check_interval_minutes', '5'),
+                    ('sell_tracking_enabled', 'true'),
+                    ('purchase_notify_enabled', 'true'),
+                    ('purchase_notify_time', '06:00'),
+                    ('last_order_check_time', ''),
+                    ('last_full_check_time', ''),
+                    ('last_sell_check_time', ''),
+                    ('last_purchase_notify_date', ''),
+                    ('first_order_date', ''),
+                    ('next_dca_purchase_time', ''),
+                    ('trading_mode', 'real'),
+                    ('last_api_check_time', ''),
+                    ('api_status', 'unknown'),
+                    ('api_error_message', ''),
+                ]
+                
+                for key, value in defaults:
+                    cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
+                
+                cursor.execute('''
+                    INSERT OR IGNORE INTO notifications (id, enabled, alert_percent, alert_interval_minutes, last_check)
+                    VALUES (1, 1, 10.0, 30, CURRENT_TIMESTAMP)
+                ''')
+                
+                conn.commit()
+                logger.info(f"Database initialized successfully")
         except Exception as e:
             logger.error(f"DB init error: {e}")
     
     def get_setting(self, key: str, default: str = '') -> str:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
-            result = cursor.fetchone()
-            conn.close()
-            return result[0] if result else default
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
+                result = cursor.fetchone()
+                return result[0] if result else default
         except Exception:
             return default
     
     def set_setting(self, key: str, value: str):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)', (key, value))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)', (key, value))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error setting {key}: {e}")
     
@@ -489,14 +496,13 @@ class Database:
     
     def is_order_already_added(self, order_id: str) -> bool:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM dca_purchases WHERE order_id = ?', (order_id,))
-            exists = cursor.fetchone() is not None
-            conn.close()
-            if exists:
-                logger.info(f"Order {order_id} already exists in dca_purchases")
-            return exists
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM dca_purchases WHERE order_id = ?', (order_id,))
+                exists = cursor.fetchone() is not None
+                if exists:
+                    logger.info(f"Order {order_id} already exists in dca_purchases")
+                return exists
         except Exception as e:
             logger.error(f"Error checking order already added: {e}")
             return False
@@ -512,20 +518,18 @@ class Database:
             return None
         
         try:
-            conn = sqlite3.connect(self.db_file, timeout=10)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT INTO dca_purchases 
-                (symbol, amount_usdt, price, quantity, multiplier, drop_percent, step_level, date, order_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (symbol, amount_usdt, price, quantity, multiplier, drop_percent, step_level, date, order_id))
-            purchase_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
-            self.update_first_order_date()
-            logger.info(f"Покупка добавлена: ID={purchase_id}, {quantity} {symbol} по {price}, order_id={order_id}")
-            return purchase_id
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO dca_purchases 
+                    (symbol, amount_usdt, price, quantity, multiplier, drop_percent, step_level, date, order_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (symbol, amount_usdt, price, quantity, multiplier, drop_percent, step_level, date, order_id))
+                purchase_id = cursor.lastrowid
+                conn.commit()
+                self.update_first_order_date()
+                logger.info(f"Покупка добавлена: ID={purchase_id}, {quantity} {symbol} по {price}, order_id={order_id}")
+                return purchase_id
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint failed" in str(e):
                 logger.warning(f"Duplicate order_id {order_id}, skipping")
@@ -538,29 +542,25 @@ class Database:
     
     def get_purchases(self, symbol: str = None) -> List[Dict]:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=10)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            if symbol:
-                cursor.execute('SELECT * FROM dca_purchases WHERE symbol = ? ORDER BY date ASC', (symbol,))
-            else:
-                cursor.execute('SELECT * FROM dca_purchases ORDER BY date ASC')
-            rows = cursor.fetchall()
-            conn.close()
-            return [dict(row) for row in rows]
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if symbol:
+                    cursor.execute('SELECT * FROM dca_purchases WHERE symbol = ? ORDER BY date ASC', (symbol,))
+                else:
+                    cursor.execute('SELECT * FROM dca_purchases ORDER BY date ASC')
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error getting purchases: {e}")
             return []
     
     def get_purchase_by_id(self, purchase_id: int) -> Optional[Dict]:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM dca_purchases WHERE id = ?', (purchase_id,))
-            row = cursor.fetchone()
-            conn.close()
-            return dict(row) if row else None
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM dca_purchases WHERE id = ?', (purchase_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
         except Exception as e:
             logger.error(f"Error getting purchase {purchase_id}: {e}")
             return None
@@ -578,15 +578,14 @@ class Database:
         values.append(purchase_id)
         query = f"UPDATE dca_purchases SET {', '.join(updates)} WHERE id = ?"
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute(query, values)
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            if success:
-                self.update_first_order_date()
-            return success
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, values)
+                success = cursor.rowcount > 0
+                conn.commit()
+                if success:
+                    self.update_first_order_date()
+                return success
         except Exception as e:
             logger.error(f"Error updating purchase {purchase_id}: {e}")
             return False
@@ -594,36 +593,16 @@ class Database:
     def delete_purchase(self, purchase_id: int) -> bool:
         try:
             purchase = self.get_purchase_by_id(purchase_id)
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM dca_purchases WHERE id = ?', (purchase_id,))
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            if success and purchase:
-                self.reset_executed_order_status(purchase['price'], purchase['quantity'], purchase['symbol'])
-            if success:
-                self.update_first_order_date()
-            return success
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM dca_purchases WHERE id = ?', (purchase_id,))
+                success = cursor.rowcount > 0
+                conn.commit()
+                if success:
+                    self.update_first_order_date()
+                return success
         except Exception as e:
             logger.error(f"Error deleting purchase {purchase_id}: {e}")
-            return False
-    
-    def reset_executed_order_status(self, price: float, quantity: float, symbol: str) -> bool:
-        try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE executed_orders 
-                SET added_to_stats = 0, skipped = 0, notified_at = NULL 
-                WHERE symbol = ? AND ABS(price - ?) < 0.0001 AND ABS(quantity - ?) < 0.0001
-            ''', (symbol, price, quantity))
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            return success
-        except Exception as e:
-            logger.error(f"Error resetting executed order status: {e}")
             return False
     
     def get_dca_stats(self, symbol: str) -> Dict:
@@ -642,274 +621,251 @@ class Database:
     
     def add_sell_order(self, symbol: str, order_id: str, quantity: float, target_price: float, profit_percent: float):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            try:
-                cursor.execute('''
-                    INSERT INTO sell_orders (symbol, order_id, quantity, target_price, profit_percent)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (symbol, order_id, quantity, target_price, profit_percent))
-                conn.commit()
-            except sqlite3.IntegrityError:
-                cursor.execute('''
-                    UPDATE sell_orders SET target_price = ?, profit_percent = ?, status = 'active'
-                    WHERE order_id = ?
-                ''', (target_price, profit_percent, order_id))
-                conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute('''
+                        INSERT INTO sell_orders (symbol, order_id, quantity, target_price, profit_percent)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (symbol, order_id, quantity, target_price, profit_percent))
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    cursor.execute('''
+                        UPDATE sell_orders SET target_price = ?, profit_percent = ?, status = 'active'
+                        WHERE order_id = ?
+                    ''', (target_price, profit_percent, order_id))
+                    conn.commit()
         except Exception as e:
             logger.error(f"Error adding sell order: {e}")
     
     def add_pending_sell_order(self, symbol: str, quantity: float, target_price: float, profit_percent: float, fail_reason: str = None) -> int:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO pending_sell_orders (symbol, quantity, target_price, profit_percent, status, retry_count, last_retry, fail_reason)
-                VALUES (?, ?, ?, ?, 'pending', 0, CURRENT_TIMESTAMP, ?)
-            ''', (symbol, quantity, target_price, profit_percent, fail_reason))
-            order_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
-            logger.info(f"Added pending sell order for {symbol}: {quantity} @ {target_price}, reason: {fail_reason}")
-            return order_id
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO pending_sell_orders (symbol, quantity, target_price, profit_percent, status, retry_count, last_retry, fail_reason)
+                    VALUES (?, ?, ?, ?, 'pending', 0, CURRENT_TIMESTAMP, ?)
+                ''', (symbol, quantity, target_price, profit_percent, fail_reason))
+                order_id = cursor.lastrowid
+                conn.commit()
+                logger.info(f"Added pending sell order for {symbol}: {quantity} @ {target_price}, reason: {fail_reason}")
+                return order_id
         except Exception as e:
             logger.error(f"Error adding pending sell order: {e}")
             return 0
     
     def get_pending_sell_orders(self, symbol: str = None) -> List[Dict]:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            if symbol:
-                cursor.execute('SELECT * FROM pending_sell_orders WHERE symbol = ? AND status = "pending" ORDER BY created_at ASC', (symbol,))
-            else:
-                cursor.execute('SELECT * FROM pending_sell_orders WHERE status = "pending" ORDER BY created_at ASC')
-            rows = cursor.fetchall()
-            conn.close()
-            return [dict(row) for row in rows]
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if symbol:
+                    cursor.execute('SELECT * FROM pending_sell_orders WHERE symbol = ? AND status = "pending" ORDER BY created_at ASC', (symbol,))
+                else:
+                    cursor.execute('SELECT * FROM pending_sell_orders WHERE status = "pending" ORDER BY created_at ASC')
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error getting pending sell orders: {e}")
             return []
     
     def update_pending_sell_order_status(self, order_id: int, status: str):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE pending_sell_orders SET status = ? WHERE id = ?', (status, order_id))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE pending_sell_orders SET status = ? WHERE id = ?', (status, order_id))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error updating pending sell order: {e}")
     
     def update_pending_sell_retry(self, order_id: int, fail_reason: str = None):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE pending_sell_orders 
-                SET retry_count = retry_count + 1, last_retry = CURRENT_TIMESTAMP, fail_reason = ?
-                WHERE id = ?
-            ''', (fail_reason, order_id))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE pending_sell_orders 
+                    SET retry_count = retry_count + 1, last_retry = CURRENT_TIMESTAMP, fail_reason = ?
+                    WHERE id = ?
+                ''', (fail_reason, order_id))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error updating pending sell retry: {e}")
     
     def delete_pending_sell_order(self, order_id: int):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM pending_sell_orders WHERE id = ?', (order_id,))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM pending_sell_orders WHERE id = ?', (order_id,))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error deleting pending sell order: {e}")
     
     def get_active_sell_orders(self, symbol: str = None) -> List[Dict]:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            if symbol:
-                cursor.execute('SELECT * FROM sell_orders WHERE symbol = ? AND status = "active" ORDER BY created_at DESC', (symbol,))
-            else:
-                cursor.execute('SELECT * FROM sell_orders WHERE status = "active" ORDER BY created_at DESC')
-            rows = cursor.fetchall()
-            conn.close()
-            return [dict(row) for row in rows]
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if symbol:
+                    cursor.execute('SELECT * FROM sell_orders WHERE symbol = ? AND status = "active" ORDER BY created_at DESC', (symbol,))
+                else:
+                    cursor.execute('SELECT * FROM sell_orders WHERE status = "active" ORDER BY created_at DESC')
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error getting active sell orders: {e}")
             return []
     
     def update_sell_order_status(self, order_id: str, status: str):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE sell_orders SET status = ? WHERE order_id = ?', (status, order_id))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE sell_orders SET status = ? WHERE order_id = ?', (status, order_id))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error updating order status: {e}")
     
     def delete_sell_order(self, order_id: str) -> bool:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM sell_orders WHERE order_id = ?', (order_id,))
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            return success
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM sell_orders WHERE order_id = ?', (order_id,))
+                success = cursor.rowcount > 0
+                conn.commit()
+                return success
         except Exception as e:
             logger.error(f"Error deleting sell order: {e}")
             return False
     
     def update_order_price(self, order_id: str, new_price: float, new_profit_percent: float):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE sell_orders SET target_price = ?, profit_percent = ? WHERE order_id = ?', 
-                          (new_price, new_profit_percent, order_id))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE sell_orders SET target_price = ?, profit_percent = ? WHERE order_id = ?', 
+                              (new_price, new_profit_percent, order_id))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error updating order price: {e}")
     
     def add_completed_sell(self, symbol: str, order_id: str, quantity: float, 
                            sell_price: float, profit_percent: float, profit_usdt: float) -> int:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO completed_sells (symbol, order_id, quantity, sell_price, profit_percent, profit_usdt, notified, stats_cleared)
-                VALUES (?, ?, ?, ?, ?, ?, 0, 0)
-            ''', (symbol, order_id, quantity, sell_price, profit_percent, profit_usdt))
-            sell_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
-            logger.info(f"Added completed sell with ID {sell_id} for {symbol}")
-            return sell_id
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO completed_sells (symbol, order_id, quantity, sell_price, profit_percent, profit_usdt, notified, stats_cleared)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+                ''', (symbol, order_id, quantity, sell_price, profit_percent, profit_usdt))
+                sell_id = cursor.lastrowid
+                conn.commit()
+                logger.info(f"Added completed sell with ID {sell_id} for {symbol}")
+                return sell_id
         except Exception as e:
             logger.error(f"Error adding completed sell: {e}")
             return 0
     
     def mark_completed_sell_notified(self, sell_id: int):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE completed_sells SET notified = 1 WHERE id = ?', (sell_id,))
-            conn.commit()
-            conn.close()
-            logger.info(f"Marked completed sell {sell_id} as notified")
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE completed_sells SET notified = 1 WHERE id = ?', (sell_id,))
+                conn.commit()
+                logger.info(f"Marked completed sell {sell_id} as notified")
         except Exception as e:
             logger.error(f"Error marking sell notified: {e}")
     
     def mark_completed_sell_stats_cleared(self, sell_id: int):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE completed_sells SET stats_cleared = 1 WHERE id = ?', (sell_id,))
-            conn.commit()
-            conn.close()
-            logger.info(f"Marked completed sell {sell_id} as stats cleared")
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE completed_sells SET stats_cleared = 1 WHERE id = ?', (sell_id,))
+                conn.commit()
+                logger.info(f"Marked completed sell {sell_id} as stats cleared")
         except Exception as e:
             logger.error(f"Error marking sell stats cleared: {e}")
     
     def set_clear_deadline(self, sell_id: int, deadline: datetime):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE completed_sells SET clear_deadline = ? WHERE id = ?', (deadline.isoformat(), sell_id))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE completed_sells SET clear_deadline = ? WHERE id = ?', (deadline.isoformat(), sell_id))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error setting clear deadline: {e}")
     
     def get_clear_deadline(self, sell_id: int) -> Optional[datetime]:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT clear_deadline FROM completed_sells WHERE id = ?', (sell_id,))
-            row = cursor.fetchone()
-            conn.close()
-            if row and row[0]:
-                return datetime.fromisoformat(row[0])
-            return None
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT clear_deadline FROM completed_sells WHERE id = ?', (sell_id,))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return datetime.fromisoformat(row[0])
+                return None
         except Exception as e:
             logger.error(f"Error getting clear deadline: {e}")
             return None
     
     def is_sell_notified(self, sell_id: int) -> bool:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT notified FROM completed_sells WHERE id = ?', (sell_id,))
-            row = cursor.fetchone()
-            conn.close()
-            return row and row[0] == 1
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT notified FROM completed_sells WHERE id = ?', (sell_id,))
+                row = cursor.fetchone()
+                return row and row[0] == 1
         except Exception as e:
             logger.error(f"Error checking sell notified: {e}")
             return False
     
     def is_sell_notified_by_order_id(self, order_id: str) -> bool:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT notified FROM completed_sells WHERE order_id = ? LIMIT 1', (order_id,))
-            row = cursor.fetchone()
-            conn.close()
-            return row and row[0] == 1
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT notified FROM completed_sells WHERE order_id = ? LIMIT 1', (order_id,))
+                row = cursor.fetchone()
+                return row and row[0] == 1
         except Exception as e:
             logger.error(f"Error checking sell notified by order_id: {e}")
             return False
     
     def get_completed_sells_not_notified(self, symbol: str = None) -> List[Dict]:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            if symbol:
-                cursor.execute('SELECT * FROM completed_sells WHERE symbol = ? AND notified = 0 ORDER BY sold_at DESC', (symbol,))
-            else:
-                cursor.execute('SELECT * FROM completed_sells WHERE notified = 0 ORDER BY sold_at DESC')
-            rows = cursor.fetchall()
-            conn.close()
-            return [dict(row) for row in rows]
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if symbol:
+                    cursor.execute('SELECT * FROM completed_sells WHERE symbol = ? AND notified = 0 ORDER BY sold_at DESC', (symbol,))
+                else:
+                    cursor.execute('SELECT * FROM completed_sells WHERE notified = 0 ORDER BY sold_at DESC')
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error getting completed sells not notified: {e}")
             return []
     
     def clear_all_purchases(self, symbol: str) -> int:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=10)
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM dca_purchases WHERE symbol = ?', (symbol,))
-            deleted_count = cursor.rowcount
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='dca_purchases'")
-            conn.commit()
-            conn.close()
-            self.update_first_order_date()
-            logger.info(f"Cleared {deleted_count} purchases for {symbol}, reset autoincrement")
-            return deleted_count
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM dca_purchases WHERE symbol = ?', (symbol,))
+                deleted_count = cursor.rowcount
+                cursor.execute("DELETE FROM sqlite_sequence WHERE name='dca_purchases'")
+                conn.commit()
+                self.update_first_order_date()
+                logger.info(f"Cleared {deleted_count} purchases for {symbol}")
+                return deleted_count
         except Exception as e:
             logger.error(f"Error clearing purchases: {e}")
             return 0
     
     def reset_autoincrement(self):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='dca_purchases'")
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='sell_orders'")
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='pending_sell_orders'")
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='completed_sells'")
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='executed_orders'")
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name='ladder_settings'")
-            conn.commit()
-            conn.close()
-            logger.info("Autoincrement reset for all tables")
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM sqlite_sequence WHERE name='dca_purchases'")
+                cursor.execute("DELETE FROM sqlite_sequence WHERE name='sell_orders'")
+                cursor.execute("DELETE FROM sqlite_sequence WHERE name='pending_sell_orders'")
+                cursor.execute("DELETE FROM sqlite_sequence WHERE name='completed_sells'")
+                cursor.execute("DELETE FROM sqlite_sequence WHERE name='executed_orders'")
+                cursor.execute("DELETE FROM sqlite_sequence WHERE name='ladder_settings'")
+                conn.commit()
+                logger.info("Autoincrement reset for all tables")
         except Exception as e:
             logger.error(f"Error resetting autoincrement: {e}")
     
@@ -981,23 +937,21 @@ class Database:
     
     def log_action(self, action: str, symbol: str = None, details: str = None):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO history (action, symbol, details) VALUES (?, ?, ?)', (action, symbol, details))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('INSERT INTO history (action, symbol, details) VALUES (?, ?, ?)', (action, symbol, details))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error logging action: {e}")
     
     def set_dca_start(self, symbol: str, initial_price: float):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM dca_start')
-            cursor.execute('INSERT INTO dca_start (id, start_date, symbol, initial_price) VALUES (1, CURRENT_TIMESTAMP, ?, ?)', 
-                          (symbol, initial_price))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM dca_start')
+                cursor.execute('INSERT INTO dca_start (id, start_date, symbol, initial_price) VALUES (1, CURRENT_TIMESTAMP, ?, ?)', 
+                              (symbol, initial_price))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error setting dca start: {e}")
     
@@ -1005,22 +959,20 @@ class Database:
         if symbol is None:
             symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM ladder_settings WHERE symbol = ? ORDER BY created_at DESC LIMIT 1', (symbol,))
-            row = cursor.fetchone()
-            conn.close()
-            if row:
-                return dict(row)
-            else:
-                return {
-                    'symbol': symbol,
-                    'max_depth': float(self.get_setting('ladder_max_depth', '80')),
-                    'base_amount': float(self.get_setting('invest_amount', '5.0')),
-                    'max_amount': float(self.get_setting('invest_amount', '5.0')) * 3,
-                    'step_percent': 1.0,
-                }
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM ladder_settings WHERE symbol = ? ORDER BY created_at DESC LIMIT 1', (symbol,))
+                row = cursor.fetchone()
+                if row:
+                    return dict(row)
+                else:
+                    return {
+                        'symbol': symbol,
+                        'max_depth': float(self.get_setting('ladder_max_depth', '80')),
+                        'base_amount': float(self.get_setting('invest_amount', '5.0')),
+                        'max_amount': float(self.get_setting('invest_amount', '5.0')) * 3,
+                        'step_percent': 1.0,
+                    }
         except Exception as e:
             logger.error(f"Error getting ladder settings: {e}")
             return {
@@ -1033,27 +985,26 @@ class Database:
     
     def save_ladder_settings(self, settings: Dict):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM ladder_settings WHERE symbol = ?', (settings['symbol'],))
-            cursor.execute('''
-                INSERT INTO ladder_settings 
-                (symbol, max_depth, base_amount, max_amount, step_percent)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (
-                settings['symbol'],
-                settings['max_depth'],
-                settings['base_amount'],
-                settings['max_amount'],
-                settings.get('step_percent', 1.0),
-            ))
-            conn.commit()
-            conn.close()
-            
-            self.set_setting('ladder_max_depth', str(settings['max_depth']))
-            self.set_setting('ladder_base_amount', str(settings['base_amount']))
-            self.set_setting('ladder_max_amount', str(settings['max_amount']))
-            self.set_setting('invest_amount', str(settings['base_amount']))
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM ladder_settings WHERE symbol = ?', (settings['symbol'],))
+                cursor.execute('''
+                    INSERT INTO ladder_settings 
+                    (symbol, max_depth, base_amount, max_amount, step_percent)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    settings['symbol'],
+                    settings['max_depth'],
+                    settings['base_amount'],
+                    settings['max_amount'],
+                    settings.get('step_percent', 1.0),
+                ))
+                conn.commit()
+                
+                self.set_setting('ladder_max_depth', str(settings['max_depth']))
+                self.set_setting('ladder_base_amount', str(settings['base_amount']))
+                self.set_setting('ladder_max_amount', str(settings['max_amount']))
+                self.set_setting('invest_amount', str(settings['base_amount']))
         except Exception as e:
             logger.error(f"Error saving ladder settings: {e}")
     
@@ -1239,63 +1190,59 @@ class Database:
     
     def add_executed_order(self, order_id: str, symbol: str, price: float, quantity: float, amount_usdt: float, executed_at: str = None) -> bool:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            if executed_at:
-                cursor.execute('''
-                    INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats, skipped, notified_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 0, 0, NULL)
-                ''', (order_id, symbol, price, quantity, amount_usdt, executed_at))
-            else:
-                cursor.execute('''
-                    INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, added_to_stats, skipped, notified_at)
-                    VALUES (?, ?, ?, ?, ?, 0, 0, NULL)
-                ''', (order_id, symbol, price, quantity, amount_usdt))
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            logger.info(f"Executed order {order_id} added to database")
-            return success
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if executed_at:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats, skipped, notified_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 0, 0, NULL)
+                    ''', (order_id, symbol, price, quantity, amount_usdt, executed_at))
+                else:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO executed_orders (order_id, symbol, price, quantity, amount_usdt, added_to_stats, skipped, notified_at)
+                        VALUES (?, ?, ?, ?, ?, 0, 0, NULL)
+                    ''', (order_id, symbol, price, quantity, amount_usdt))
+                success = cursor.rowcount > 0
+                conn.commit()
+                logger.info(f"Executed order {order_id} added to database")
+                return success
         except Exception as e:
             logger.error(f"Error adding executed order: {e}")
             return False
     
     def is_order_notified(self, order_id: str) -> bool:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM executed_orders WHERE order_id = ? AND (added_to_stats = 1 OR skipped = 1)', (order_id,))
-            exists = cursor.fetchone() is not None
-            conn.close()
-            return exists
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT 1 FROM executed_orders WHERE order_id = ? AND (added_to_stats = 1 OR skipped = 1)', (order_id,))
+                exists = cursor.fetchone() is not None
+                return exists
         except Exception as e:
             logger.error(f"Error checking order notified: {e}")
             return False
     
     def mark_order_as_added(self, order_id: str) -> bool:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE executed_orders SET added_to_stats = 1, notified_at = CURRENT_TIMESTAMP WHERE order_id = ?', (order_id,))
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            logger.info(f"Order {order_id} marked as added to stats")
-            return success
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE executed_orders SET added_to_stats = 1, notified_at = CURRENT_TIMESTAMP WHERE order_id = ?', (order_id,))
+                success = cursor.rowcount > 0
+                conn.commit()
+                logger.info(f"Order {order_id} marked as added to stats")
+                return success
         except Exception as e:
             logger.error(f"Error marking order as added: {e}")
             return False
     
     def mark_order_as_skipped(self, order_id: str) -> bool:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE executed_orders SET skipped = 1, notified_at = CURRENT_TIMESTAMP WHERE order_id = ?', (order_id,))
-            success = cursor.rowcount > 0
-            conn.commit()
-            conn.close()
-            logger.info(f"Order {order_id} marked as skipped")
-            return success
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('UPDATE executed_orders SET skipped = 1, notified_at = CURRENT_TIMESTAMP WHERE order_id = ?', (order_id,))
+                success = cursor.rowcount > 0
+                conn.commit()
+                logger.info(f"Order {order_id} marked as skipped")
+                return success
         except Exception as e:
             logger.error(f"Error marking order as skipped: {e}")
             return False
@@ -1345,22 +1292,20 @@ class Database:
     
     def get_authorized_user_id(self) -> Optional[int]:
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT value FROM bot_state WHERE key = "authorized_user_id"')
-            row = cursor.fetchone()
-            conn.close()
-            return int(row[0]) if row else None
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT value FROM bot_state WHERE key = "authorized_user_id"')
+                row = cursor.fetchone()
+                return int(row[0]) if row else None
         except Exception:
             return None
     
     def set_authorized_user_id(self, user_id: int):
         try:
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)', ('authorized_user_id', str(user_id)))
-            conn.commit()
-            conn.close()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)', ('authorized_user_id', str(user_id)))
+                conn.commit()
         except Exception as e:
             logger.error(f"Error saving authorized user id: {e}")
     
@@ -1372,74 +1317,72 @@ class Database:
             completed_sells = self.get_completed_sells_not_notified()
             settings = {}
             
-            conn = sqlite3.connect(self.db_file, timeout=5)
-            cursor = conn.cursor()
-            cursor.execute('SELECT key, value FROM settings')
-            for key, value in cursor.fetchall():
-                settings[key] = value
-            
-            cursor.execute('SELECT enabled, alert_percent, alert_interval_minutes FROM notifications WHERE id = 1')
-            notification_row = cursor.fetchone()
-            notifications = {
-                'enabled': bool(notification_row[0]) if notification_row else True,
-                'alert_percent': notification_row[1] if notification_row else 10.0,
-                'alert_interval_minutes': notification_row[2] if notification_row else 30
-            }
-            
-            cursor.execute('SELECT start_date, symbol, initial_price FROM dca_start WHERE id = 1')
-            dca_start_row = cursor.fetchone()
-            dca_start = {
-                'start_date': dca_start_row[0] if dca_start_row else None,
-                'symbol': dca_start_row[1] if dca_start_row else None,
-                'initial_price': dca_start_row[2] if dca_start_row else None
-            } if dca_start_row else None
-            
-            cursor.execute('SELECT * FROM ladder_settings')
-            ladder_rows = cursor.fetchall()
-            ladder_settings = []
-            for row in ladder_rows:
-                ladder_settings.append({
-                    'id': row[0],
-                    'symbol': row[1],
-                    'max_depth': row[2],
-                    'base_amount': row[3],
-                    'max_amount': row[4],
-                    'step_percent': row[5] if len(row) > 5 else 1.0,
-                    'created_at': row[6] if len(row) > 6 else None
-                })
-            
-            cursor.execute('SELECT * FROM executed_orders')
-            executed_rows = cursor.fetchall()
-            executed_orders = []
-            for row in executed_rows:
-                if len(row) >= 10:
-                    executed_orders.append({
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT key, value FROM settings')
+                for key, value in cursor.fetchall():
+                    settings[key] = value
+                
+                cursor.execute('SELECT enabled, alert_percent, alert_interval_minutes FROM notifications WHERE id = 1')
+                notification_row = cursor.fetchone()
+                notifications = {
+                    'enabled': bool(notification_row[0]) if notification_row else True,
+                    'alert_percent': notification_row[1] if notification_row else 10.0,
+                    'alert_interval_minutes': notification_row[2] if notification_row else 30
+                }
+                
+                cursor.execute('SELECT start_date, symbol, initial_price FROM dca_start WHERE id = 1')
+                dca_start_row = cursor.fetchone()
+                dca_start = {
+                    'start_date': dca_start_row[0] if dca_start_row else None,
+                    'symbol': dca_start_row[1] if dca_start_row else None,
+                    'initial_price': dca_start_row[2] if dca_start_row else None
+                } if dca_start_row else None
+                
+                cursor.execute('SELECT * FROM ladder_settings')
+                ladder_rows = cursor.fetchall()
+                ladder_settings = []
+                for row in ladder_rows:
+                    ladder_settings.append({
                         'id': row[0],
-                        'order_id': row[1],
-                        'symbol': row[2],
-                        'price': row[3],
-                        'quantity': row[4],
-                        'amount_usdt': row[5],
-                        'executed_at': row[6],
-                        'added_to_stats': row[7],
-                        'skipped': row[8] if len(row) > 8 else 0,
-                        'notified_at': row[9] if len(row) > 9 else None
+                        'symbol': row[1],
+                        'max_depth': row[2],
+                        'base_amount': row[3],
+                        'max_amount': row[4],
+                        'step_percent': row[5] if len(row) > 5 else 1.0,
+                        'created_at': row[6] if len(row) > 6 else None
                     })
-                else:
-                    executed_orders.append({
-                        'id': row[0],
-                        'order_id': row[1],
-                        'symbol': row[2],
-                        'price': row[3],
-                        'quantity': row[4],
-                        'amount_usdt': row[5],
-                        'executed_at': row[6],
-                        'added_to_stats': row[7] if len(row) > 7 else 0,
-                        'skipped': 0,
-                        'notified_at': None
-                    })
-            
-            conn.close()
+                
+                cursor.execute('SELECT * FROM executed_orders')
+                executed_rows = cursor.fetchall()
+                executed_orders = []
+                for row in executed_rows:
+                    if len(row) >= 10:
+                        executed_orders.append({
+                            'id': row[0],
+                            'order_id': row[1],
+                            'symbol': row[2],
+                            'price': row[3],
+                            'quantity': row[4],
+                            'amount_usdt': row[5],
+                            'executed_at': row[6],
+                            'added_to_stats': row[7],
+                            'skipped': row[8] if len(row) > 8 else 0,
+                            'notified_at': row[9] if len(row) > 9 else None
+                        })
+                    else:
+                        executed_orders.append({
+                            'id': row[0],
+                            'order_id': row[1],
+                            'symbol': row[2],
+                            'price': row[3],
+                            'quantity': row[4],
+                            'amount_usdt': row[5],
+                            'executed_at': row[6],
+                            'added_to_stats': row[7] if len(row) > 7 else 0,
+                            'skipped': 0,
+                            'notified_at': None
+                        })
             
             export_data = {
                 'export_date': get_moscow_time_naive().strftime('%Y-%m-%d %H:%M:%S'),
@@ -1468,194 +1411,208 @@ class Database:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            conn = sqlite3.connect(self.db_file, timeout=10)
-            cursor = conn.cursor()
-            
-            cursor.execute("PRAGMA foreign_keys = OFF")
-            
-            cursor.execute("DELETE FROM dca_purchases")
-            cursor.execute("DELETE FROM sell_orders")
-            cursor.execute("DELETE FROM pending_sell_orders")
-            cursor.execute("DELETE FROM completed_sells")
-            cursor.execute("DELETE FROM settings")
-            cursor.execute("DELETE FROM dca_start")
-            cursor.execute("DELETE FROM ladder_settings")
-            cursor.execute("DELETE FROM executed_orders")
-            cursor.execute("DELETE FROM history")
-            cursor.execute("DELETE FROM notifications")
-            
-            self.reset_autoincrement()
-            
-            purchases_imported = 0
-            for purchase in data.get('purchases', []):
-                try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute("PRAGMA foreign_keys = OFF")
+                
+                cursor.execute("DELETE FROM dca_purchases")
+                cursor.execute("DELETE FROM sell_orders")
+                cursor.execute("DELETE FROM pending_sell_orders")
+                cursor.execute("DELETE FROM completed_sells")
+                cursor.execute("DELETE FROM settings")
+                cursor.execute("DELETE FROM dca_start")
+                cursor.execute("DELETE FROM ladder_settings")
+                cursor.execute("DELETE FROM executed_orders")
+                cursor.execute("DELETE FROM history")
+                cursor.execute("DELETE FROM notifications")
+                
+                self.reset_autoincrement()
+                
+                purchases_imported = 0
+                for purchase in data.get('purchases', []):
+                    try:
+                        cursor.execute('''
+                            INSERT INTO dca_purchases 
+                            (id, symbol, amount_usdt, price, quantity, multiplier, drop_percent, step_level, date, created_at, order_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            purchase.get('id'),
+                            purchase.get('symbol', DEFAULT_SYMBOL),
+                            purchase.get('amount_usdt', 0),
+                            purchase.get('price', 0),
+                            purchase.get('quantity', 0),
+                            purchase.get('multiplier', 1.0),
+                            purchase.get('drop_percent', 0),
+                            purchase.get('step_level', 0),
+                            purchase.get('date', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
+                            purchase.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
+                            purchase.get('order_id')
+                        ))
+                        purchases_imported += 1
+                    except Exception as e:
+                        logger.warning(f"Error importing purchase: {e}")
+                        continue
+                
+                orders_imported = 0
+                for order in data.get('sell_orders', []):
+                    try:
+                        cursor.execute('''
+                            INSERT OR IGNORE INTO sell_orders 
+                            (id, symbol, order_id, quantity, target_price, profit_percent, created_at, status)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            order.get('id'),
+                            order.get('symbol', DEFAULT_SYMBOL),
+                            order.get('order_id', f"imported_{order.get('id', 0)}"),
+                            order.get('quantity', 0),
+                            order.get('target_price', 0),
+                            order.get('profit_percent', 5),
+                            order.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
+                            order.get('status', 'active')
+                        ))
+                        orders_imported += 1
+                    except Exception as e:
+                        logger.warning(f"Error importing order: {e}")
+                        continue
+                
+                for pending in data.get('pending_sell_orders', []):
+                    try:
+                        cursor.execute('''
+                            INSERT OR IGNORE INTO pending_sell_orders 
+                            (id, symbol, quantity, target_price, profit_percent, created_at, status, retry_count, fail_reason)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            pending.get('id'),
+                            pending.get('symbol', DEFAULT_SYMBOL),
+                            pending.get('quantity', 0),
+                            pending.get('target_price', 0),
+                            pending.get('profit_percent', 5),
+                            pending.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
+                            pending.get('status', 'pending'),
+                            pending.get('retry_count', 0),
+                            pending.get('fail_reason')
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Error importing pending order: {e}")
+                        continue
+                
+                for sell in data.get('completed_sells', []):
+                    try:
+                        cursor.execute('''
+                            INSERT INTO completed_sells 
+                            (id, symbol, order_id, quantity, sell_price, profit_percent, profit_usdt, sold_at, notified, stats_cleared)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            sell.get('id'),
+                            sell.get('symbol', DEFAULT_SYMBOL),
+                            sell.get('order_id'),
+                            sell.get('quantity', 0),
+                            sell.get('sell_price', 0),
+                            sell.get('profit_percent', 0),
+                            sell.get('profit_usdt', 0),
+                            sell.get('sold_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
+                            sell.get('notified', 0),
+                            sell.get('stats_cleared', 0)
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Error importing completed sell: {e}")
+                        continue
+                
+                for key, value in data.get('settings', {}).items():
+                    try:
+                        cursor.execute('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)', (key, value))
+                    except Exception:
+                        pass
+                
+                dca_start = data.get('dca_start')
+                if dca_start and dca_start.get('start_date'):
+                    try:
+                        cursor.execute('INSERT OR REPLACE INTO dca_start (id, start_date, symbol, initial_price) VALUES (1, ?, ?, ?)',
+                                      (dca_start['start_date'], dca_start.get('symbol', DEFAULT_SYMBOL), dca_start.get('initial_price', 0)))
+                    except Exception:
+                        pass
+                
+                notifications = data.get('notifications', {})
+                if notifications:
+                    try:
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO notifications (id, enabled, alert_percent, alert_interval_minutes, last_check)
+                            VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ''', (1 if notifications.get('enabled', True) else 0, notifications.get('alert_percent', 10.0), notifications.get('alert_interval_minutes', 30)))
+                    except Exception as e:
+                        logger.warning(f"Error importing notifications: {e}")
+                else:
                     cursor.execute('''
-                        INSERT INTO dca_purchases 
-                        (id, symbol, amount_usdt, price, quantity, multiplier, drop_percent, step_level, date, created_at, order_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        purchase.get('id'),
-                        purchase.get('symbol', DEFAULT_SYMBOL),
-                        purchase.get('amount_usdt', 0),
-                        purchase.get('price', 0),
-                        purchase.get('quantity', 0),
-                        purchase.get('multiplier', 1.0),
-                        purchase.get('drop_percent', 0),
-                        purchase.get('step_level', 0),
-                        purchase.get('date', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
-                        purchase.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
-                        purchase.get('order_id')
-                    ))
-                    purchases_imported += 1
-                except Exception as e:
-                    logger.warning(f"Error importing purchase: {e}")
-                    continue
-            
-            orders_imported = 0
-            for order in data.get('sell_orders', []):
-                try:
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO sell_orders 
-                        (id, symbol, order_id, quantity, target_price, profit_percent, created_at, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        order.get('id'),
-                        order.get('symbol', DEFAULT_SYMBOL),
-                        order.get('order_id', f"imported_{order.get('id', 0)}"),
-                        order.get('quantity', 0),
-                        order.get('target_price', 0),
-                        order.get('profit_percent', 5),
-                        order.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
-                        order.get('status', 'active')
-                    ))
-                    orders_imported += 1
-                except Exception as e:
-                    logger.warning(f"Error importing order: {e}")
-                    continue
-            
-            for pending in data.get('pending_sell_orders', []):
-                try:
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO pending_sell_orders 
-                        (id, symbol, quantity, target_price, profit_percent, created_at, status, retry_count, fail_reason)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        pending.get('id'),
-                        pending.get('symbol', DEFAULT_SYMBOL),
-                        pending.get('quantity', 0),
-                        pending.get('target_price', 0),
-                        pending.get('profit_percent', 5),
-                        pending.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
-                        pending.get('status', 'pending'),
-                        pending.get('retry_count', 0),
-                        pending.get('fail_reason')
-                    ))
-                except Exception as e:
-                    logger.warning(f"Error importing pending order: {e}")
-                    continue
-            
-            for sell in data.get('completed_sells', []):
-                try:
-                    cursor.execute('''
-                        INSERT INTO completed_sells 
-                        (id, symbol, order_id, quantity, sell_price, profit_percent, profit_usdt, sold_at, notified, stats_cleared)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        sell.get('id'),
-                        sell.get('symbol', DEFAULT_SYMBOL),
-                        sell.get('order_id'),
-                        sell.get('quantity', 0),
-                        sell.get('sell_price', 0),
-                        sell.get('profit_percent', 0),
-                        sell.get('profit_usdt', 0),
-                        sell.get('sold_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
-                        sell.get('notified', 0),
-                        sell.get('stats_cleared', 0)
-                    ))
-                except Exception as e:
-                    logger.warning(f"Error importing completed sell: {e}")
-                    continue
-            
-            for key, value in data.get('settings', {}).items():
-                try:
-                    cursor.execute('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)', (key, value))
-                except Exception:
-                    pass
-            
-            dca_start = data.get('dca_start')
-            if dca_start and dca_start.get('start_date'):
-                try:
-                    cursor.execute('INSERT OR REPLACE INTO dca_start (id, start_date, symbol, initial_price) VALUES (1, ?, ?, ?)',
-                                  (dca_start['start_date'], dca_start.get('symbol', DEFAULT_SYMBOL), dca_start.get('initial_price', 0)))
-                except Exception:
-                    pass
-            
-            notifications = data.get('notifications', {})
-            if notifications:
-                try:
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO notifications (id, enabled, alert_percent, alert_interval_minutes, last_check)
-                        VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
-                    ''', (1 if notifications.get('enabled', True) else 0, notifications.get('alert_percent', 10.0), notifications.get('alert_interval_minutes', 30)))
-                except Exception as e:
-                    logger.warning(f"Error importing notifications: {e}")
-            else:
-                cursor.execute('''
-                    INSERT OR IGNORE INTO notifications (id, enabled, alert_percent, alert_interval_minutes, last_check)
-                    VALUES (1, 1, 10.0, 30, CURRENT_TIMESTAMP)
-                ''')
-            
-            for ladder in data.get('ladder_settings', []):
-                try:
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO ladder_settings 
-                        (id, symbol, max_depth, base_amount, max_amount, step_percent, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        ladder.get('id'),
-                        ladder.get('symbol', DEFAULT_SYMBOL),
-                        ladder.get('max_depth', 80),
-                        ladder.get('base_amount', 1.1),
-                        ladder.get('max_amount', 3.3),
-                        ladder.get('step_percent', 1.0),
-                        ladder.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S"))
-                    ))
-                except Exception as e:
-                    logger.warning(f"Error importing ladder: {e}")
-                    continue
-            
-            for executed in data.get('executed_orders', []):
-                try:
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO executed_orders 
-                        (id, order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats, skipped, notified_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        executed.get('id'),
-                        executed.get('order_id'),
-                        executed.get('symbol', DEFAULT_SYMBOL),
-                        executed.get('price', 0),
-                        executed.get('quantity', 0),
-                        executed.get('amount_usdt', 0),
-                        executed.get('executed_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
-                        executed.get('added_to_stats', 0),
-                        executed.get('skipped', 0),
-                        executed.get('notified_at')
-                    ))
-                except Exception as e:
-                    logger.warning(f"Error importing executed order: {e}")
-                    continue
-            
-            cursor.execute("PRAGMA foreign_keys = ON")
-            conn.commit()
-            conn.close()
-            
-            self.update_first_order_date()
-            return True, f"Импортировано: {purchases_imported} покупок, {orders_imported} ордеров"
+                        INSERT OR IGNORE INTO notifications (id, enabled, alert_percent, alert_interval_minutes, last_check)
+                        VALUES (1, 1, 10.0, 30, CURRENT_TIMESTAMP)
+                    ''')
+                
+                for ladder in data.get('ladder_settings', []):
+                    try:
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO ladder_settings 
+                            (id, symbol, max_depth, base_amount, max_amount, step_percent, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            ladder.get('id'),
+                            ladder.get('symbol', DEFAULT_SYMBOL),
+                            ladder.get('max_depth', 80),
+                            ladder.get('base_amount', 1.1),
+                            ladder.get('max_amount', 3.3),
+                            ladder.get('step_percent', 1.0),
+                            ladder.get('created_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S"))
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Error importing ladder: {e}")
+                        continue
+                
+                for executed in data.get('executed_orders', []):
+                    try:
+                        cursor.execute('''
+                            INSERT OR IGNORE INTO executed_orders 
+                            (id, order_id, symbol, price, quantity, amount_usdt, executed_at, added_to_stats, skipped, notified_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            executed.get('id'),
+                            executed.get('order_id'),
+                            executed.get('symbol', DEFAULT_SYMBOL),
+                            executed.get('price', 0),
+                            executed.get('quantity', 0),
+                            executed.get('amount_usdt', 0),
+                            executed.get('executed_at', get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")),
+                            executed.get('added_to_stats', 0),
+                            executed.get('skipped', 0),
+                            executed.get('notified_at')
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Error importing executed order: {e}")
+                        continue
+                
+                cursor.execute("PRAGMA foreign_keys = ON")
+                conn.commit()
+                
+                self.update_first_order_date()
+                return True, f"Импортировано: {purchases_imported} покупок, {orders_imported} ордеров"
         except Exception as e:
             logger.error(f"Error importing database: {e}")
             return False, str(e)
+    
+    async def health_check(self) -> Dict:
+        """Проверка состояния бота"""
+        return {
+            'status': 'ok' if self.get_api_status() == 'working' else 'degraded',
+            'db_connected': True,
+            'api_connected': self.get_api_status() == 'working',
+            'bot_running': True,
+            'dca_active': self.get_setting('dca_active', 'false') == 'true',
+            'timestamp': get_moscow_time().isoformat(),
+            'version': BOT_VERSION,
+            'symbol': self.get_setting('symbol', DEFAULT_SYMBOL)
+        }
 
+
+# ============ BYBIT CLIENT ============
 
 class BybitClient:
     def __init__(self, api_key: str = None, api_secret: str = None, testnet: bool = False):
@@ -1671,6 +1628,7 @@ class BybitClient:
         self._instrument_cache = {}
         self._instrument_cache_time = {}
         self._instrument_cache_ttl = 3600
+        self.rate_limiter = RateLimiter(max_calls=30, period=60.0)
         self._init_session()
     
     def _init_session(self):
@@ -1699,6 +1657,10 @@ class BybitClient:
             self._refresh_session()
         return self.session is not None and self.api_key and self.api_secret
     
+    async def _call_with_rate_limit(self, func, *args, **kwargs):
+        async with self.rate_limiter:
+            return func(*args, **kwargs)
+    
     async def check_api_health(self) -> Dict:
         self._refresh_session()
         
@@ -1721,7 +1683,9 @@ class BybitClient:
                         'is_api_error': True
                     }
             
-            response = self.session.get_wallet_balance(accountType="UNIFIED")
+            response = await self._call_with_rate_limit(
+                self.session.get_wallet_balance, accountType="UNIFIED"
+            )
             
             if response['retCode'] == 0:
                 return {'success': True, 'message': 'API ключ работает'}
@@ -1766,7 +1730,9 @@ class BybitClient:
         try:
             if not self.session:
                 self._init_session()
-            response = self.session.get_tickers(category="spot", symbol=symbol)
+            response = await self._call_with_rate_limit(
+                self.session.get_tickers, category="spot", symbol=symbol
+            )
             if response['retCode'] == 0 and response['result']['list']:
                 price = float(response['result']['list'][0]['lastPrice'])
                 self._price_cache[symbol] = price
@@ -1806,7 +1772,9 @@ class BybitClient:
                 self._init_session()
             
             try:
-                response = self.session.get_wallet_balance(accountType="UNIFIED")
+                response = await self._call_with_rate_limit(
+                    self.session.get_wallet_balance, accountType="UNIFIED"
+                )
                 if response['retCode'] == 0:
                     result_list = response['result']['list']
                     if result_list:
@@ -1832,7 +1800,9 @@ class BybitClient:
             except Exception as e:
                 logger.warning(f"Error getting balance with UNIFIED: {e}")
                 try:
-                    response = self.session.get_wallet_balance(accountType="SPOT")
+                    response = await self._call_with_rate_limit(
+                        self.session.get_wallet_balance, accountType="SPOT"
+                    )
                     if response['retCode'] == 0:
                         result_list = response['result']['list']
                         if result_list:
@@ -1849,9 +1819,6 @@ class BybitClient:
                                         usd_value = float(c.get('usdValue', 0) or 0)
                                         logger.info(f"Balance for {coin} (SPOT): available={available}, equity={equity}")
                                         return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
-                            else:
-                                total_equity = float(account_data.get('totalEquity', 0) or 0)
-                                return {'total_equity': total_equity, 'coins': coins}
                 except Exception as e2:
                     logger.warning(f"Error getting balance with SPOT: {e2}")
             
@@ -1870,7 +1837,9 @@ class BybitClient:
             params = {"category": "spot"}
             if symbol:
                 params['symbol'] = symbol
-            response = self.session.get_open_orders(**params)
+            response = await self._call_with_rate_limit(
+                self.session.get_open_orders, **params
+            )
             if response['retCode'] == 0:
                 return response['result']['list']
             return []
@@ -1897,7 +1866,9 @@ class BybitClient:
             params = {"category": "spot", "limit": limit}
             if symbol:
                 params['symbol'] = symbol
-            response = self.session.get_order_history(**params)
+            response = await self._call_with_rate_limit(
+                self.session.get_order_history, **params
+            )
             if response['retCode'] == 0:
                 return response['result']['list']
             return []
@@ -1916,7 +1887,9 @@ class BybitClient:
         try:
             if not self.session:
                 self._init_session()
-            response = self.session.get_instruments_info(category="spot", symbol=symbol)
+            response = await self._call_with_rate_limit(
+                self.session.get_instruments_info, category="spot", symbol=symbol
+            )
             if response['retCode'] == 0 and response['result']['list']:
                 info = response['result']['list'][0]
                 lot_size_filter = info.get('lotSizeFilter', {})
@@ -2080,7 +2053,9 @@ class BybitClient:
         try:
             if not self.session:
                 self._init_session()
-            response = self.session.cancel_order(category="spot", symbol=symbol, orderId=order_id)
+            response = await self._call_with_rate_limit(
+                self.session.cancel_order, category="spot", symbol=symbol, orderId=order_id
+            )
             if response['retCode'] == 0:
                 return {'success': True}
             return {'success': False, 'error': response['retMsg']}
@@ -2093,7 +2068,9 @@ class BybitClient:
         try:
             if not self.session:
                 self._init_session()
-            response = self.session.amend_order(category="spot", symbol=symbol, orderId=order_id, price=str(new_price))
+            response = await self._call_with_rate_limit(
+                self.session.amend_order, category="spot", symbol=symbol, orderId=order_id, price=str(new_price)
+            )
             if response['retCode'] == 0:
                 return {'success': True}
             return {'success': False, 'error': response['retMsg']}
@@ -2136,7 +2113,8 @@ class BybitClient:
             
             logger.info(f"Placing sell order: {rounded_quantity} {symbol} @ {rounded_price} (decimals={qty_decimals})")
             
-            response = self.session.place_order(
+            response = await self._call_with_rate_limit(
+                self.session.place_order,
                 category="spot", symbol=symbol, side="Sell", orderType="Limit", 
                 qty=str(rounded_quantity), price=str(rounded_price), timeInForce="GTC"
             )
@@ -2205,7 +2183,8 @@ class BybitClient:
             
             logger.info(f"Placing buy order: {rounded_quantity} {symbol} @ {rounded_price}")
             
-            response = self.session.place_order(
+            response = await self._call_with_rate_limit(
+                self.session.place_order,
                 category="spot", symbol=symbol, side="Buy", orderType="Limit", 
                 qty=str(rounded_quantity), price=str(rounded_price), timeInForce="GTC"
             )
@@ -2218,6 +2197,8 @@ class BybitClient:
             logger.error(f"Error placing buy order: {e}")
             return {'success': False, 'error': str(e)}
 
+
+# ============ DCA STRATEGY ============
 
 class DCAStrategy:
     def __init__(self, db: Database, bybit: BybitClient):
@@ -3167,11 +3148,10 @@ class DCAStrategy:
         active_sell_orders = self.db.get_active_sell_orders(symbol)
         active_order_ids = {o['order_id'] for o in active_sell_orders}
         
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        cursor = conn.cursor()
-        cursor.execute('SELECT order_id FROM sell_orders WHERE symbol = ?', (symbol,))
-        all_our_order_ids = {row[0] for row in cursor.fetchall()}
-        conn.close()
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT order_id FROM sell_orders WHERE symbol = ?', (symbol,))
+            all_our_order_ids = {row[0] for row in cursor.fetchall()}
         
         our_completed = []
         for sell in all_completed:
@@ -3256,18 +3236,14 @@ class DCAStrategy:
         return our_completed
     
     async def auto_clear_expired_stats(self, symbol: str, user_id: int, bot):
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        now = get_moscow_time_naive()
-        cursor.execute('''
-            SELECT id, symbol, order_id FROM completed_sells 
-            WHERE notified = 1 AND stats_cleared = 0 AND clear_deadline IS NOT NULL AND clear_deadline <= ?
-        ''', (now.isoformat(),))
-        
-        expired_sells = cursor.fetchall()
-        conn.close()
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            now = get_moscow_time_naive()
+            cursor.execute('''
+                SELECT id, symbol, order_id FROM completed_sells 
+                WHERE notified = 1 AND stats_cleared = 0 AND clear_deadline IS NOT NULL AND clear_deadline <= ?
+            ''', (now.isoformat(),))
+            expired_sells = cursor.fetchall()
         
         for sell in expired_sells:
             sell_id = sell['id']
@@ -3338,14 +3314,13 @@ class DCAStrategy:
         for p in purchases:
             added_orders.add(f"{round(p['price'], 4)}_{round(p['quantity'], 8)}")
         
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        cursor = conn.cursor()
-        try:
-            cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
-            executed_records = cursor.fetchall()
-        except Exception as e:
-            executed_records = []
-        conn.close()
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
+                executed_records = cursor.fetchall()
+            except Exception as e:
+                executed_records = []
         
         processed_order_ids = set()
         for record in executed_records:
@@ -3403,14 +3378,13 @@ class DCAStrategy:
         for p in purchases:
             added_orders.add(f"{round(p['price'], 4)}_{round(p['quantity'], 8)}")
         
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        cursor = conn.cursor()
-        try:
-            cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
-            executed_records = cursor.fetchall()
-        except Exception as e:
-            executed_records = []
-        conn.close()
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute('SELECT order_id, added_to_stats, skipped FROM executed_orders WHERE symbol = ?', (symbol,))
+                executed_records = cursor.fetchall()
+            except Exception as e:
+                executed_records = []
         
         processed_order_ids = set()
         for record in executed_records:
@@ -3493,20 +3467,22 @@ class DCAStrategy:
         added_orders = set()
         for p in purchases:
             added_orders.add(f"{round(p['price'], 4)}_{round(p['quantity'], 8)}")
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        cursor = conn.cursor()
-        try:
-            cursor.execute('SELECT order_id, added_to_stats, skipped, price, quantity FROM executed_orders WHERE symbol = ?', (symbol,))
-            executed_records = cursor.fetchall()
-        except Exception as e:
-            executed_records = []
-        conn.close()
+        
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute('SELECT order_id, added_to_stats, skipped, price, quantity FROM executed_orders WHERE symbol = ?', (symbol,))
+                executed_records = cursor.fetchall()
+            except Exception as e:
+                executed_records = []
+        
         processed_order_ids = set()
         for record in executed_records:
             added_to_stats = record[1] if len(record) > 1 else 0
             skipped = record[2] if len(record) > 2 else 0
             if added_to_stats == 1 or skipped == 1:
                 processed_order_ids.add(record[0])
+        
         missing_orders = []
         already_added = []
         for order in all_orders:
@@ -3554,11 +3530,10 @@ class DCAStrategy:
         all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
         logger.info(f"Force check: found {len(all_completed)} completed sell orders for {symbol} since {check_date}")
         
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        cursor = conn.cursor()
-        cursor.execute('SELECT order_id FROM sell_orders WHERE symbol = ?', (symbol,))
-        our_order_ids = {row[0] for row in cursor.fetchall()}
-        conn.close()
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT order_id FROM sell_orders WHERE symbol = ?', (symbol,))
+            our_order_ids = {row[0] for row in cursor.fetchall()}
         
         already_processed = self.db.get_completed_sells_not_notified(symbol)
         processed_order_ids = set([s['order_id'] for s in already_processed])
@@ -3812,6 +3787,23 @@ class DCAStrategy:
             return {'success': False, 'error': str(e)}
 
 
+# ============ ОСНОВНОЙ БОТ ============
+
+async def safe_send_message(bot, chat_id, text, parse_mode=None, reply_markup=None, **kwargs):
+    try:
+        if parse_mode:
+            return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup, **kwargs)
+        else:
+            return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, **kwargs)
+    except Exception as e:
+        if "Can't parse entities" in str(e) or "Bad Request" in str(e):
+            logger.warning(f"Markdown parse error, sending without formatting: {e}")
+            clean_text = text.replace('*', '').replace('`', '').replace('_', '')
+            return await bot.send_message(chat_id=chat_id, text=clean_text, reply_markup=reply_markup)
+        else:
+            raise e
+
+
 class FastDCABot:
     def __init__(self):
         self.db = Database()
@@ -3915,92 +3907,6 @@ class FastDCABot:
                 await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
                 logger.info(f"API error notification sent (attempt {self._api_error_count})")
             return False
-    
-    async def cmd_check_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        
-        await update.message.reply_text("🔍 Проверяю API ключ...")
-        
-        self.refresh_api_session()
-        
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ API не инициализирован. Проверьте .env файл.")
-            return
-        
-        health = await self.bybit.check_api_health()
-        
-        if health['success']:
-            self._api_was_working = True
-            self.db.set_api_status('working')
-            self.db.set_api_error_message('')
-            message = (
-                "✅ *API Bybit работает корректно!*\n\n"
-                "🔑 Ключ активен и имеет необходимые права.\n"
-                "🕐 Время проверки: `{}`"
-            ).format(get_moscow_time().strftime('%H:%M:%S'))
-            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
-        else:
-            error_code = health.get('error_code', 'N/A')
-            user_message = health.get('user_message', 'Неизвестная ошибка')
-            
-            message = (
-                "🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
-                "❌ Статус: `НЕ РАБОТАЕТ`\n"
-                "📝 Ошибка: `{}`\n"
-                "🔢 Код: `{}`\n\n"
-                "⚠️ *Что делать:*\n"
-                "1️⃣ Проверьте API ключ в файле `.env`\n"
-                "2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
-                "3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
-                "4️⃣ Проверьте IP в белом списке Bybit"
-            ).format(user_message, error_code)
-            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
-    
-    async def cmd_refresh_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        
-        await update.message.reply_text("🔄 Обновляю API ключи из .env...")
-        
-        load_dotenv()
-        api_key = os.getenv('BYBIT_API_KEY')
-        api_secret = os.getenv('BYBIT_API_SECRET')
-        
-        if not api_key or not api_secret:
-            await update.message.reply_text("❌ Ключи не найдены в .env файле!")
-            return
-        
-        await update.message.reply_text(f"✅ Ключи найдены:\nAPI Key: {api_key[:8]}...{api_key[-4:]}")
-        
-        self.refresh_api_session()
-        
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ Не удалось создать сессию Bybit")
-            return
-        
-        await update.message.reply_text("🔍 Проверяю работоспособность ключей...")
-        health = await self.bybit.check_api_health()
-        
-        if health['success']:
-            self._api_was_working = True
-            self.db.set_api_status('working')
-            self.db.set_api_error_message('')
-            await update.message.reply_text(
-                "✅ *API Bybit работает корректно!*\n\n"
-                "🔑 Ключи актуальны и имеют необходимые права.",
-                parse_mode='Markdown'
-            )
-        else:
-            error_code = health.get('error_code', 'N/A')
-            user_message = health.get('user_message', 'Неизвестная ошибка')
-            message = (
-                "❌ *Ошибка API*\n\n"
-                "📝 {}\n"
-                "🔢 Код: {}\n\n"
-                "Проверьте ключи в .env файле."
-            ).format(user_message, error_code)
-            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
     
     async def _check_user_fast(self, update: Update) -> bool:
         user = update.effective_user
@@ -4160,6 +4066,8 @@ class FastDCABot:
             next_time += timedelta(hours=frequency_hours)
         
         return next_time
+    
+    # ============ КОМАНДЫ ============
     
     async def cmd_start_fast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -6090,6 +5998,31 @@ class FastDCABot:
             
             await asyncio.sleep(60)
     
+    async def api_check_loop(self):
+        logger.info("API check loop started (every 6 hours)")
+        
+        await asyncio.sleep(60)
+        
+        while self.scheduler_running:
+            try:
+                self.refresh_api_session()
+                
+                if self.bybit_initialized:
+                    await self.check_api_and_notify(is_startup=False)
+                else:
+                    self._init_bybit()
+                    if self.bybit_initialized:
+                        await self.check_api_and_notify(is_startup=False)
+                
+                await asyncio.sleep(6 * 3600)
+                
+            except asyncio.CancelledError:
+                logger.info("API check loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"API check loop error: {e}")
+                await asyncio.sleep(300)
+    
     async def send_sell_recommendation_from_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         profit_percent = float(self.db.get_setting('profit_percent', '5'))
@@ -6241,12 +6174,10 @@ class FastDCABot:
             await query.edit_message_text(f"❌ Ошибка при очистке статистики для {symbol}")
     
     async def add_executed_order_to_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM executed_orders WHERE order_id = ?', (order_id,))
-        order = cursor.fetchone()
-        conn.close()
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM executed_orders WHERE order_id = ?', (order_id,))
+            order = cursor.fetchone()
         if not order:
             await update.callback_query.edit_message_text("❌ Ордер не найден в базе.")
             return
@@ -6342,6 +6273,19 @@ class FastDCABot:
         self.scheduler_running = False
         self._is_running = False
         
+        # Сохраняем состояние
+        state = {
+            'last_check_time': get_moscow_time().isoformat(),
+            'dca_active': self.db.get_setting('dca_active', 'false'),
+            'shutdown_time': get_moscow_time().isoformat()
+        }
+        try:
+            with open(STATE_FILE, 'w') as f:
+                json.dump(state, f)
+            logger.info("State saved")
+        except Exception as e:
+            logger.error(f"Error saving state: {e}")
+        
         if self._sell_check_task and not self._sell_check_task.done():
             self._sell_check_task.cancel()
         
@@ -6353,31 +6297,6 @@ class FastDCABot:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
         
         logger.info("Bot shutdown complete")
-    
-    async def api_check_loop(self):
-        logger.info("API check loop started (every 6 hours)")
-        
-        await asyncio.sleep(60)
-        
-        while self.scheduler_running:
-            try:
-                self.refresh_api_session()
-                
-                if self.bybit_initialized:
-                    await self.check_api_and_notify(is_startup=False)
-                else:
-                    self._init_bybit()
-                    if self.bybit_initialized:
-                        await self.check_api_and_notify(is_startup=False)
-                
-                await asyncio.sleep(6 * 3600)
-                
-            except asyncio.CancelledError:
-                logger.info("API check loop cancelled")
-                break
-            except Exception as e:
-                logger.error(f"API check loop error: {e}")
-                await asyncio.sleep(300)
     
     def setup_handlers(self):
         logger.info("Setting up handlers...")
@@ -6531,19 +6450,107 @@ class FastDCABot:
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_unknown))
         logger.info("Handlers setup completed")
     
-    def run(self):
-        if self._is_running:
-            logger.warning("Bot already running, ignoring duplicate run()")
+    async def cmd_refresh_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_user_fast(update):
             return
         
+        await update.message.reply_text("🔄 Обновляю API ключи из .env...")
+        
+        load_dotenv()
+        api_key = os.getenv('BYBIT_API_KEY')
+        api_secret = os.getenv('BYBIT_API_SECRET')
+        
+        if not api_key or not api_secret:
+            await update.message.reply_text("❌ Ключи не найдены в .env файле!")
+            return
+        
+        await update.message.reply_text(f"✅ Ключи найдены:\nAPI Key: {api_key[:8]}...{api_key[-4:]}")
+        
+        self.refresh_api_session()
+        
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ Не удалось создать сессию Bybit")
+            return
+        
+        await update.message.reply_text("🔍 Проверяю работоспособность ключей...")
+        health = await self.bybit.check_api_health()
+        
+        if health['success']:
+            self._api_was_working = True
+            self.db.set_api_status('working')
+            self.db.set_api_error_message('')
+            await update.message.reply_text(
+                "✅ *API Bybit работает корректно!*\n\n"
+                "🔑 Ключи актуальны и имеют необходимые права.",
+                parse_mode='Markdown'
+            )
+        else:
+            error_code = health.get('error_code', 'N/A')
+            user_message = health.get('user_message', 'Неизвестная ошибка')
+            message = (
+                "❌ *Ошибка API*\n\n"
+                "📝 {}\n"
+                "🔢 Код: {}\n\n"
+                "Проверьте ключи в .env файле."
+            ).format(user_message, error_code)
+            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
+
+
+def check_pid():
+    """Проверка, не запущен ли уже бот"""
+    try:
+        with open(PID_FILE, 'r') as f:
+            old_pid = int(f.read().strip())
+        try:
+            os.kill(old_pid, 0)
+        except OSError:
+            return False
+        return True
+    except (FileNotFoundError, ValueError):
+        return False
+
+def write_pid():
+    """Запись PID в файл"""
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+def remove_pid():
+    """Удаление PID файла"""
+    try:
+        os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
+
+def signal_handler(signum, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    logger.info(f"Received signal {signum}, shutting down...")
+    remove_pid()
+    sys.exit(0)
+
+
+def main():
+    # Проверка PID
+    if check_pid():
+        print(f"{Fore.RED}❌ Бот уже запущен (PID файл существует)!")
+        sys.exit(1)
+    
+    write_pid()
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
         print(f"\n{Fore.CYAN}{'='*60}")
         print(f"{Fore.CYAN}🚀 ЗАПУСК DCA BYBIT BOT (МАРТИНГЕЙЛ ЛЕСТНИЦОЙ)")
         print(f"{Fore.CYAN}Версия: {BOT_VERSION}")
         print(f"{Fore.CYAN}Часовой пояс: Москва (UTC+3)")
         print(f"{Fore.CYAN}{'='*60}")
+        
         if not TELEGRAM_TOKEN:
             print(f"{Fore.RED}❌ TELEGRAM_BOT_TOKEN не найден!")
+            remove_pid()
             return
+        
         print(f"{Fore.GREEN}✅ Токен: {TELEGRAM_TOKEN[:10]}...{TELEGRAM_TOKEN[-5:]}")
         print(f"{Fore.WHITE}👤 Пользователь: {AUTHORIZED_USER}")
         print(f"{Fore.WHITE}🌐 Testnet (из .env): {'Да' if BYBIT_TESTNET_DEFAULT else 'Нет'}")
@@ -6551,13 +6558,18 @@ class FastDCABot:
         print(f"{Fore.WHITE}🕐 Московское время: {get_moscow_time().strftime('%H:%M')}")
         print(f"{Fore.CYAN}{'='*60}\n")
         
-        self.application.post_init = self.post_init
-        self.application.shutdown = self.shutdown
+        bot = FastDCABot()
+        bot.application.post_init = bot.post_init
+        bot.application.shutdown = bot.shutdown
+        
         try:
-            self.application.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0, timeout=60)
+            bot.application.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=1.0, timeout=60)
         except Exception as e:
             logger.error(f"Failed to start bot: {e}")
             print(f"{Fore.RED}❌ Ошибка: {e}")
+    
+    finally:
+        remove_pid()
 
 
 if __name__ == "__main__":
@@ -6567,5 +6579,4 @@ if __name__ == "__main__":
         print("Устанавливаю colorama...")
         os.system(f"{sys.executable} -m pip install colorama")
         import colorama
-    bot = FastDCABot()
-    bot.run()
+    main()
