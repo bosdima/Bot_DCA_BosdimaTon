@@ -403,7 +403,7 @@ class Database:
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '15.0'),
                 ('order_execution_notify', 'true'),
-                ('order_check_interval_minutes', '5'),
+                ('order_check_interval_minutes', '60'),
                 ('sell_tracking_enabled', 'true'),
                 ('purchase_notify_enabled', 'true'),
                 ('purchase_notify_time', '06:00'),
