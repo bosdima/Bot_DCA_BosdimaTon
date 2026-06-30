@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.15.1 (29.06.2026)
+Версия 5.16.0 (30.06.2026)
 ИСПРАВЛЕНИЯ:
-- Исправлена ошибка подписи API Bybit (ErrCode: 10004)
-- Исправлена обработка Markdown в Telegram сообщениях
+- Автоматическое определение типа аккаунта (SPOT/UNIFIED) для суб-аккаунтов
+- Исправлено получение баланса для суб-аккаунтов
+- Добавлена диагностика аккаунта
 - Улучшена обработка ошибок API
 """
 
@@ -73,7 +74,7 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.15.1 (29.06.2026)"
+BOT_VERSION = "5.16.0 (30.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 SELL_DECIMALS_FALLBACK = 5
@@ -417,6 +418,7 @@ class Database:
                 ('last_api_check_time', ''),
                 ('api_status', 'unknown'),
                 ('api_error_message', ''),
+                ('account_type', 'unknown'),
             ]
             
             for key, value in defaults:
@@ -978,6 +980,12 @@ class Database:
     
     def set_api_error_message(self, message: str):
         self.set_setting('api_error_message', message)
+    
+    def get_account_type(self) -> str:
+        return self.get_setting('account_type', 'unknown')
+    
+    def set_account_type(self, account_type: str):
+        self.set_setting('account_type', account_type)
     
     def log_action(self, action: str, symbol: str = None, details: str = None):
         try:
@@ -1671,6 +1679,7 @@ class BybitClient:
         self._instrument_cache = {}
         self._instrument_cache_time = {}
         self._instrument_cache_ttl = 3600
+        self._account_type = None  # Будет определено автоматически
         self._init_session()
     
     def _init_session(self):
@@ -1699,6 +1708,118 @@ class BybitClient:
             self._refresh_session()
         return self.session is not None and self.api_key and self.api_secret
     
+    async def detect_account_type(self) -> str:
+        """Автоматически определяет тип аккаунта (SPOT или UNIFIED)"""
+        if self._account_type and self._account_type != 'unknown':
+            return self._account_type
+        
+        if not self._is_api_available():
+            return 'unknown'
+        
+        try:
+            # Пробуем SPOT
+            logger.info("Checking SPOT account type...")
+            response = self.session.get_wallet_balance(accountType="SPOT")
+            if response['retCode'] == 0:
+                self._account_type = 'SPOT'
+                self.db.set_account_type('SPOT')
+                logger.info("✅ Account type detected: SPOT")
+                return 'SPOT'
+        except Exception as e:
+            logger.warning(f"SPOT check failed: {e}")
+        
+        try:
+            # Пробуем UNIFIED
+            logger.info("Checking UNIFIED account type...")
+            response = self.session.get_wallet_balance(accountType="UNIFIED")
+            if response['retCode'] == 0:
+                self._account_type = 'UNIFIED'
+                self.db.set_account_type('UNIFIED')
+                logger.info("✅ Account type detected: UNIFIED")
+                return 'UNIFIED'
+        except Exception as e:
+            logger.warning(f"UNIFIED check failed: {e}")
+        
+        self._account_type = 'unknown'
+        self.db.set_account_type('unknown')
+        logger.warning("⚠️ Could not detect account type")
+        return 'unknown'
+    
+    async def get_balance(self, coin: str = None) -> Dict:
+        if not self._is_api_available():
+            return {'error': 'API не доступен'}
+        
+        try:
+            if not self.session:
+                self._init_session()
+            
+            # Определяем тип аккаунта, если еще не определен
+            account_type = await self.detect_account_type()
+            
+            # Пробуем SPOT
+            if account_type == 'SPOT' or account_type == 'unknown':
+                try:
+                    response = self.session.get_wallet_balance(accountType="SPOT")
+                    if response['retCode'] == 0:
+                        result_list = response['result']['list']
+                        if result_list:
+                            account_data = result_list[0]
+                            coins = account_data.get('coin', [])
+                            
+                            if coin:
+                                for c in coins:
+                                    if c.get('coin') == coin:
+                                        wallet_balance = float(c.get('walletBalance', 0) or 0)
+                                        equity = float(c.get('equity', 0) or 0) or wallet_balance
+                                        locked = float(c.get('locked', 0) or 0)
+                                        available = wallet_balance - locked
+                                        usd_value = float(c.get('usdValue', 0) or 0)
+                                        logger.info(f"Balance for {coin} (SPOT): available={available}, equity={equity}")
+                                        return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
+                                
+                                logger.warning(f"Coin {coin} not found in SPOT response")
+                                return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
+                            else:
+                                total_equity = float(account_data.get('totalEquity', 0) or 0)
+                                return {'total_equity': total_equity, 'coins': coins}
+                except Exception as e:
+                    logger.warning(f"SPOT balance failed: {e}")
+            
+            # Пробуем UNIFIED
+            if account_type == 'UNIFIED' or account_type == 'unknown':
+                try:
+                    response = self.session.get_wallet_balance(accountType="UNIFIED")
+                    if response['retCode'] == 0:
+                        result_list = response['result']['list']
+                        if result_list:
+                            account_data = result_list[0]
+                            coins = account_data.get('coin', [])
+                            
+                            if coin:
+                                for c in coins:
+                                    if c.get('coin') == coin:
+                                        wallet_balance = float(c.get('walletBalance', 0) or 0)
+                                        equity = float(c.get('equity', 0) or 0) or wallet_balance
+                                        locked = float(c.get('locked', 0) or 0)
+                                        available = wallet_balance - locked
+                                        usd_value = float(c.get('usdValue', 0) or 0)
+                                        logger.info(f"Balance for {coin} (UNIFIED): available={available}, equity={equity}")
+                                        return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
+                                
+                                logger.warning(f"Coin {coin} not found in UNIFIED response")
+                                return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
+                            else:
+                                total_equity = float(account_data.get('totalEquity', 0) or 0)
+                                return {'total_equity': total_equity, 'coins': coins}
+                except Exception as e:
+                    logger.warning(f"UNIFIED balance failed: {e}")
+            
+            return {'error': 'Не удалось получить баланс'}
+            
+        except Exception as e:
+            logger.error(f"Error getting balance: {e}")
+            return {'error': str(e)}
+    
     async def check_api_health(self) -> Dict:
         self._refresh_session()
         
@@ -1721,31 +1842,25 @@ class BybitClient:
                         'is_api_error': True
                     }
             
-            response = self.session.get_wallet_balance(accountType="UNIFIED")
+            # Определяем тип аккаунта
+            account_type = await self.detect_account_type()
             
-            if response['retCode'] == 0:
-                return {'success': True, 'message': 'API ключ работает'}
-            else:
-                error_code = response.get('retCode', 0)
-                error_msg = response.get('retMsg', 'Неизвестная ошибка')
-                
-                error_descriptions = {
-                    10003: 'API ключ не найден',
-                    10004: 'API ключ истек (expired) или неверный (проверьте секретный ключ)',
-                    10005: 'Неверный API ключ или секрет',
-                    10006: 'Недостаточно прав для этого действия',
-                    10010: 'IP-адрес не в белом списке',
-                    10016: 'Превышен лимит запросов',
+            # Получаем баланс для проверки
+            balance = await self.get_balance('USDT')
+            
+            if balance and 'error' not in balance:
+                return {
+                    'success': True,
+                    'message': 'API ключ работает',
+                    'account_type': account_type,
+                    'usdt_balance': balance.get('available', 0)
                 }
-                
-                user_message = error_descriptions.get(error_code, error_msg)
-                
+            else:
                 return {
                     'success': False,
-                    'error': error_msg,
-                    'error_code': error_code,
-                    'user_message': user_message,
-                    'is_api_error': error_code in [10003, 10004, 10005, 10006, 10010, 10016]
+                    'error': balance.get('error', 'Неизвестная ошибка'),
+                    'user_message': 'Не удалось получить баланс. Проверьте права ключа.',
+                    'is_api_error': True
                 }
                 
         except Exception as e:
@@ -1796,70 +1911,6 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error cancelling sell orders: {e}")
             return 0, []
-    
-    async def get_balance(self, coin: str = None) -> Dict:
-        if not self._is_api_available():
-            return {'error': 'API не доступен'}
-        
-        try:
-            if not self.session:
-                self._init_session()
-            
-            try:
-                response = self.session.get_wallet_balance(accountType="UNIFIED")
-                if response['retCode'] == 0:
-                    result_list = response['result']['list']
-                    if result_list:
-                        account_data = result_list[0]
-                        coins = account_data.get('coin', [])
-                        
-                        if coin:
-                            for c in coins:
-                                if c.get('coin') == coin:
-                                    wallet_balance = float(c.get('walletBalance', 0) or 0)
-                                    equity = float(c.get('equity', 0) or 0) or wallet_balance
-                                    locked = float(c.get('locked', 0) or 0)
-                                    available = wallet_balance - locked
-                                    usd_value = float(c.get('usdValue', 0) or 0)
-                                    logger.info(f"Balance for {coin} (UNIFIED): available={available}, equity={equity}")
-                                    return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
-                            
-                            logger.warning(f"Coin {coin} not found in UNIFIED response")
-                            return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
-                        else:
-                            total_equity = float(account_data.get('totalEquity', 0) or 0)
-                            return {'total_equity': total_equity, 'coins': coins}
-            except Exception as e:
-                logger.warning(f"Error getting balance with UNIFIED: {e}")
-                try:
-                    response = self.session.get_wallet_balance(accountType="SPOT")
-                    if response['retCode'] == 0:
-                        result_list = response['result']['list']
-                        if result_list:
-                            account_data = result_list[0]
-                            coins = account_data.get('coin', [])
-                            
-                            if coin:
-                                for c in coins:
-                                    if c.get('coin') == coin:
-                                        wallet_balance = float(c.get('walletBalance', 0) or 0)
-                                        equity = float(c.get('equity', 0) or 0) or wallet_balance
-                                        locked = float(c.get('locked', 0) or 0)
-                                        available = wallet_balance - locked
-                                        usd_value = float(c.get('usdValue', 0) or 0)
-                                        logger.info(f"Balance for {coin} (SPOT): available={available}, equity={equity}")
-                                        return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
-                            else:
-                                total_equity = float(account_data.get('totalEquity', 0) or 0)
-                                return {'total_equity': total_equity, 'coins': coins}
-                except Exception as e2:
-                    logger.warning(f"Error getting balance with SPOT: {e2}")
-            
-            return {'error': 'Не удалось получить баланс'}
-            
-        except Exception as e:
-            logger.error(f"Error getting balance: {e}")
-            return {'error': str(e)}
     
     async def get_open_orders(self, symbol: str = None) -> List[Dict]:
         if not self._is_api_available():
@@ -3881,10 +3932,15 @@ class FastDCABot:
                 self.db.set_api_status('working')
                 self.db.set_api_error_message('')
                 
+                account_type = health.get('account_type', 'unknown')
+                usdt_balance = health.get('usdt_balance', 0)
+                
                 if user_id and not is_startup:
                     message = (
                         "✅ *API Bybit восстановлен!*\n\n"
                         "🔑 Ключи работают корректно.\n"
+                        f"📊 Тип аккаунта: `{account_type}`\n"
+                        f"💵 USDT доступно: `{usdt_balance:.2f}`\n"
                         "🕐 Время проверки: `{}`"
                     ).format(get_moscow_time().strftime('%H:%M:%S'))
                     await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
@@ -3934,9 +3990,13 @@ class FastDCABot:
             self._api_was_working = True
             self.db.set_api_status('working')
             self.db.set_api_error_message('')
+            account_type = health.get('account_type', 'unknown')
+            usdt_balance = health.get('usdt_balance', 0)
             message = (
                 "✅ *API Bybit работает корректно!*\n\n"
                 "🔑 Ключ активен и имеет необходимые права.\n"
+                f"📊 Тип аккаунта: `{account_type}`\n"
+                f"💵 USDT доступно: `{usdt_balance:.2f}`\n"
                 "🕐 Время проверки: `{}`"
             ).format(get_moscow_time().strftime('%H:%M:%S'))
             await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
@@ -3956,6 +4016,43 @@ class FastDCABot:
                 "4️⃣ Проверьте IP в белом списке Bybit"
             ).format(user_message, error_code)
             await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
+    
+    async def cmd_account_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для отображения информации об аккаунте"""
+        if not await self._check_user_fast(update):
+            return
+        
+        self._init_bybit()
+        if not self.bybit_initialized:
+            await update.message.reply_text("❌ API не инициализирован.")
+            return
+        
+        await update.message.reply_text("🔍 Определяю тип аккаунта...")
+        
+        account_type = await self.bybit.detect_account_type()
+        
+        # Получаем баланс USDT
+        balance = await self.bybit.get_balance('USDT')
+        usdt_available = balance.get('available', 0) if balance else 0
+        
+        # Получаем баланс основного токена
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        coin = symbol.replace('USDT', '')
+        coin_balance = await self.bybit.get_balance(coin)
+        coin_available = coin_balance.get('available', 0) if coin_balance else 0
+        coin_equity = coin_balance.get('equity', 0) if coin_balance else 0
+        
+        await update.message.reply_text(
+            f"📊 *Информация об аккаунте*\n\n"
+            f"🔑 Тип аккаунта: `{account_type}`\n"
+            f"💵 USDT доступно: `{usdt_available:.2f}`\n"
+            f"🪙 {coin} доступно: `{format_quantity(coin_available, 5)}`\n"
+            f"🪙 {coin} всего: `{format_quantity(coin_equity, 5)}`\n"
+            f"🪙 Токен: `{symbol}`\n\n"
+            f"✅ API-ключ привязан к аккаунту типа {account_type}\n"
+            f"🔄 Бот автоматически работает с этим аккаунтом.",
+            parse_mode='Markdown'
+        )
     
     async def cmd_refresh_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -3986,9 +4083,11 @@ class FastDCABot:
             self._api_was_working = True
             self.db.set_api_status('working')
             self.db.set_api_error_message('')
+            account_type = health.get('account_type', 'unknown')
             await update.message.reply_text(
-                "✅ *API Bybit работает корректно!*\n\n"
-                "🔑 Ключи актуальны и имеют необходимые права.",
+                f"✅ *API Bybit работает корректно!*\n\n"
+                f"🔑 Ключи актуальны и имеют необходимые права.\n"
+                f"📊 Тип аккаунта: `{account_type}`",
                 parse_mode='Markdown'
             )
         else:
@@ -4090,6 +4189,7 @@ class FastDCABot:
         mode = self.db.get_trading_mode()
         mode_button = "🌐 Режим: Демо" if mode == 'demo' else "🌐 Режим: Обычный"
         manual_amount = self.db.get_manual_amount()
+        account_type = self.db.get_account_type()
         keyboard = [
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("🚀 Настройки Авто DCA")],
             [KeyboardButton("📊 Процент прибыли"), KeyboardButton("🪜 Лестница Мартингейла")],
@@ -4188,6 +4288,8 @@ class FastDCABot:
                 api_status_text = "✅ РАБОТАЕТ"
                 self._api_was_working = True
                 self.db.set_api_status('working')
+                account_type = health.get('account_type', 'unknown')
+                self.db.set_account_type(account_type)
             else:
                 api_status_text = f"❌ {health.get('user_message', 'Ошибка')}"
                 self._api_was_working = False
@@ -4195,18 +4297,21 @@ class FastDCABot:
                 self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
         
         status_emoji = api_status_text.split()[0] if api_status_text.split() else api_status_text
+        account_type = self.db.get_account_type()
         
         start_message = (
             f"👋 Привет, {update.effective_user.first_name}!\n\n"
             f"🤖 DCA Bybit Bot (Мартингейл лесенкой)\n"
             f"📌 Версия: {BOT_VERSION}\n"
             f"🌐 Режим: {mode_text}\n"
+            f"📊 Тип аккаунта: {account_type if account_type != 'unknown' else '🔍 Определяется...'}\n"
             f"🕐 Московское время: {current_time.strftime('%H:%M')}\n\n"
             f"🔑 *Статус API Bybit:* {api_status_text}\n\n"
             f"✅ Бот запущен и готов к работе!\n"
             f"🌐 Доступ к бирже Bybit по API ключу {status_emoji}\n\n"
             f"📋 Уведомления об исполненных ордерах будут приходить сюда.\n"
-            f"🔄 Проверка API выполняется каждые 6 часов."
+            f"🔄 Проверка API выполняется каждые 6 часов.\n\n"
+            f"ℹ️ Команда /account_info - показать информацию об аккаунте"
         )
         
         await safe_send_message(self.application.bot, update.effective_user.id, start_message, parse_mode='Markdown', reply_markup=self.get_main_keyboard())
@@ -5054,10 +5159,12 @@ class FastDCABot:
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
         api_status = self.db.get_api_status()
         api_error = self.db.get_api_error_message()
+        account_type = self.db.get_account_type()
         api_status_text = "✅ Работает" if api_status == 'working' else f"❌ {api_error if api_error else 'Неизвестно'}"
         
         message = f"📋 *Статус бота*\n\n"
         message += f"🌐 Режим: {mode_text}\n"
+        message += f"📊 Тип аккаунта: {account_type if account_type != 'unknown' else '🔍 Определяется...'}\n"
         message += f"🔑 API Bybit: {api_status_text}\n"
         message += f"🤖 Статус: {'✅ Активен' if is_active else '⏹ Остановлен'}\n"
         if is_active and next_purchase_str:
@@ -5193,12 +5300,14 @@ class FastDCABot:
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
         manual_amount = self.db.get_manual_amount()
+        account_type = self.db.get_account_type()
         await update.message.reply_text(
             f"⚙️ *Настройки*\n\n"
             f"🪙 Токен: `{symbol}`\n"
             f"📈 Цель: `{profit_percent}%`\n"
             f"💵 Сумма для ручного ордера: `{manual_amount}` USDT\n"
-            f"🌐 Режим: {mode_text}\n\n"
+            f"🌐 Режим: {mode_text}\n"
+            f"📊 Тип аккаунта: {account_type if account_type != 'unknown' else '🔍 Определяется...'}\n\n"
             f"Выберите раздел:",
             reply_markup=self.get_settings_keyboard(),
             parse_mode='Markdown'
@@ -6383,6 +6492,7 @@ class FastDCABot:
         logger.info("Setting up handlers...")
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
         self.application.add_handler(CommandHandler("check_api", self.cmd_check_api))
+        self.application.add_handler(CommandHandler("account_info", self.cmd_account_info))
         self.application.add_handler(CommandHandler("refresh_api", self.cmd_refresh_api))
         self.application.add_handler(CommandHandler("check_sells", self.cmd_check_sells))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_|confirm_clear_stats_|skip_clear_stats_)'))
