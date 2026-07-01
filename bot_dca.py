@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.16.0 (30.06.2026)
+Версия 5.12.1 (27.06.2026)
 ИСПРАВЛЕНИЯ:
-- Автоматическое определение типа аккаунта (SPOT/UNIFIED) для суб-аккаунтов
-- Исправлено получение баланса для суб-аккаунтов
-- Добавлена диагностика аккаунта
-- Улучшена обработка ошибок API
+- Исправлена работа с суб-аккаунтами Bybit (UNIFIED аккаунт)
+- Исправлена логика создания ордера на продажу - только при наличии покупок
+- Улучшена обработка баланса для разных типов аккаунтов
+- Исправлены ошибки при запуске DCA без истории покупок
+- ИСПРАВЛЕНИЕ: динамическое определение точности количества для продажи (qty_decimals из инструмента)
 """
 
 import os
@@ -52,12 +53,7 @@ if sys.platform == 'win32':
 init(autoreset=True)
 load_dotenv()
 
-# ============ НАСТРОЙКИ ТОКЕНОВ ============
-DEFAULT_SYMBOL = "ETHUSDT"
-POPULAR_SYMBOLS = ["ETHUSDT", "GRAMUSDT", "XRPUSDT", "BTCUSDT"]
-# ===========================================
-
-# Настройка логов с ротацией
+# Настройка логов с ротацией (максимум 200 КБ)
 log_handler = RotatingFileHandler("bot_errors.log", encoding='utf-8', maxBytes=200*1024, backupCount=2)
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
@@ -72,11 +68,15 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
+BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
+BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.16.0 (30.06.2026)"
+BOT_VERSION = "5.12.1 (27.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
+
+# Фиксированное количество знаков для продажи (используется как запасной вариант)
 SELL_DECIMALS_FALLBACK = 5
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -86,12 +86,6 @@ def get_moscow_time() -> datetime:
 
 def get_moscow_time_naive() -> datetime:
     return datetime.now(MOSCOW_TZ).replace(tzinfo=None)
-
-def get_api_keys():
-    load_dotenv()
-    api_key = os.getenv('BYBIT_API_KEY')
-    api_secret = os.getenv('BYBIT_API_SECRET')
-    return api_key, api_secret
 
 # Состояния
 (
@@ -134,6 +128,7 @@ def get_api_keys():
 ) = range(36)
 
 DB_EXPORT_FILE = 'dca_data_export.json'
+POPULAR_SYMBOLS = ["TONUSDT", "BTCUSDT", "ETHUSDT"]
 MAX_DROP_DEPTH = 80
 
 MAIN_MENU_BUTTONS = [
@@ -144,20 +139,6 @@ MAIN_MENU_BUTTONS = [
     "💰 Отслеживание продаж Вкл", "⏳ Отслеживание продаж Выкл", "🏠 Главное меню",
     "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку", "❌ Отмена"
 ]
-
-async def safe_send_message(bot, chat_id, text, parse_mode=None, reply_markup=None, **kwargs):
-    try:
-        if parse_mode:
-            return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup, **kwargs)
-        else:
-            return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, **kwargs)
-    except Exception as e:
-        if "Can't parse entities" in str(e) or "Bad Request" in str(e):
-            logger.warning(f"Markdown parse error, sending without formatting: {e}")
-            clean_text = text.replace('*', '').replace('`', '').replace('_', '')
-            return await bot.send_message(chat_id=chat_id, text=clean_text, reply_markup=reply_markup)
-        else:
-            raise e
 
 def format_price(price: float, decimals: int = 4) -> str:
     if price is None: return "N/A"
@@ -190,6 +171,9 @@ def calculate_current_drop(current_price: float, avg_price: float) -> float:
     if avg_price <= 0: return 0
     drop = ((avg_price - current_price) / avg_price) * 100
     return max(0, drop)
+
+def get_recommended_purchase_amount(drop_percent: float, base_amount: float, max_amount: float, max_depth: float = MAX_DROP_DEPTH) -> float:
+    return get_amount_by_drop(drop_percent, base_amount, max_amount, max_depth)
 
 def calculate_apy(profit_usdt: float, total_invested: float, days: int) -> float:
     if days <= 0 or total_invested <= 0:
@@ -372,6 +356,7 @@ class Database:
             else:
                 cursor.execute("PRAGMA table_info(executed_orders)")
                 columns = [col[1] for col in cursor.fetchall()]
+                
                 if 'skipped' not in columns:
                     cursor.execute("ALTER TABLE executed_orders ADD COLUMN skipped BOOLEAN DEFAULT 0")
                 if 'notified_at' not in columns:
@@ -387,7 +372,7 @@ class Database:
             ''')
             
             defaults = [
-                ('symbol', DEFAULT_SYMBOL),
+                ('symbol', 'TONUSDT'),
                 ('invest_amount', '5.0'),
                 ('manual_amount', '1.1'),
                 ('profit_percent', '5'),
@@ -404,7 +389,7 @@ class Database:
                 ('ladder_max_depth', '80'),
                 ('ladder_max_amount', '15.0'),
                 ('order_execution_notify', 'true'),
-                ('order_check_interval_minutes', '60'),
+                ('order_check_interval_minutes', '5'),
                 ('sell_tracking_enabled', 'true'),
                 ('purchase_notify_enabled', 'true'),
                 ('purchase_notify_time', '06:00'),
@@ -415,10 +400,6 @@ class Database:
                 ('first_order_date', ''),
                 ('next_dca_purchase_time', ''),
                 ('trading_mode', 'real'),
-                ('last_api_check_time', ''),
-                ('api_status', 'unknown'),
-                ('api_error_message', ''),
-                ('account_type', 'unknown'),
             ]
             
             for key, value in defaults:
@@ -957,36 +938,6 @@ class Database:
     def set_manual_amount(self, amount: float):
         self.set_setting('manual_amount', str(amount))
     
-    def get_last_api_check_time(self) -> Optional[datetime]:
-        time_str = self.get_setting('last_api_check_time', '')
-        if time_str:
-            try:
-                return datetime.fromisoformat(time_str)
-            except:
-                return None
-        return None
-    
-    def set_last_api_check_time(self, check_time: datetime):
-        self.set_setting('last_api_check_time', check_time.isoformat())
-    
-    def get_api_status(self) -> str:
-        return self.get_setting('api_status', 'unknown')
-    
-    def set_api_status(self, status: str):
-        self.set_setting('api_status', status)
-    
-    def get_api_error_message(self) -> str:
-        return self.get_setting('api_error_message', '')
-    
-    def set_api_error_message(self, message: str):
-        self.set_setting('api_error_message', message)
-    
-    def get_account_type(self) -> str:
-        return self.get_setting('account_type', 'unknown')
-    
-    def set_account_type(self, account_type: str):
-        self.set_setting('account_type', account_type)
-    
     def log_action(self, action: str, symbol: str = None, details: str = None):
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
@@ -1011,7 +962,7 @@ class Database:
     
     def get_ladder_settings(self, symbol: str = None) -> Dict:
         if symbol is None:
-            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.get_setting('symbol', 'TONUSDT')
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
             conn.row_factory = sqlite3.Row
@@ -1067,7 +1018,7 @@ class Database:
     
     def calculate_ladder_purchase(self, current_price: float, symbol: str = None) -> Dict:
         if symbol is None:
-            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.get_setting('symbol', 'TONUSDT')
         
         stats = self.get_dca_stats(symbol)
         if not stats or stats['total_quantity'] <= 0:
@@ -1124,7 +1075,7 @@ class Database:
     
     def get_recommendation_for_current_drop(self, current_price: float, symbol: str = None, for_manual: bool = False) -> Dict:
         if symbol is None:
-            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.get_setting('symbol', 'TONUSDT')
         
         stats = self.get_dca_stats(symbol)
         
@@ -1174,7 +1125,7 @@ class Database:
     
     def get_ladder_summary(self, symbol: str = None, current_price: float = None) -> Dict:
         if symbol is None:
-            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.get_setting('symbol', 'TONUSDT')
         
         settings = self.get_ladder_settings(symbol)
         stats = self.get_dca_stats(symbol)
@@ -1242,7 +1193,7 @@ class Database:
     
     def reset_ladder(self, symbol: str = None):
         if symbol is None:
-            symbol = self.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.get_setting('symbol', 'TONUSDT')
         self.clear_all_purchases(symbol)
     
     def add_executed_order(self, order_id: str, symbol: str, price: float, quantity: float, amount_usdt: float, executed_at: str = None) -> bool:
@@ -1503,7 +1454,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         purchase.get('id'),
-                        purchase.get('symbol', DEFAULT_SYMBOL),
+                        purchase.get('symbol', 'TONUSDT'),
                         purchase.get('amount_usdt', 0),
                         purchase.get('price', 0),
                         purchase.get('quantity', 0),
@@ -1528,7 +1479,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         order.get('id'),
-                        order.get('symbol', DEFAULT_SYMBOL),
+                        order.get('symbol', 'TONUSDT'),
                         order.get('order_id', f"imported_{order.get('id', 0)}"),
                         order.get('quantity', 0),
                         order.get('target_price', 0),
@@ -1549,7 +1500,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         pending.get('id'),
-                        pending.get('symbol', DEFAULT_SYMBOL),
+                        pending.get('symbol', 'TONUSDT'),
                         pending.get('quantity', 0),
                         pending.get('target_price', 0),
                         pending.get('profit_percent', 5),
@@ -1570,7 +1521,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         sell.get('id'),
-                        sell.get('symbol', DEFAULT_SYMBOL),
+                        sell.get('symbol', 'TONUSDT'),
                         sell.get('order_id'),
                         sell.get('quantity', 0),
                         sell.get('sell_price', 0),
@@ -1594,7 +1545,7 @@ class Database:
             if dca_start and dca_start.get('start_date'):
                 try:
                     cursor.execute('INSERT OR REPLACE INTO dca_start (id, start_date, symbol, initial_price) VALUES (1, ?, ?, ?)',
-                                  (dca_start['start_date'], dca_start.get('symbol', DEFAULT_SYMBOL), dca_start.get('initial_price', 0)))
+                                  (dca_start['start_date'], dca_start.get('symbol', 'TONUSDT'), dca_start.get('initial_price', 0)))
                 except Exception:
                     pass
             
@@ -1621,7 +1572,7 @@ class Database:
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         ladder.get('id'),
-                        ladder.get('symbol', DEFAULT_SYMBOL),
+                        ladder.get('symbol', 'TONUSDT'),
                         ladder.get('max_depth', 80),
                         ladder.get('base_amount', 1.1),
                         ladder.get('max_amount', 3.3),
@@ -1641,7 +1592,7 @@ class Database:
                     ''', (
                         executed.get('id'),
                         executed.get('order_id'),
-                        executed.get('symbol', DEFAULT_SYMBOL),
+                        executed.get('symbol', 'TONUSDT'),
                         executed.get('price', 0),
                         executed.get('quantity', 0),
                         executed.get('amount_usdt', 0),
@@ -1666,9 +1617,7 @@ class Database:
 
 
 class BybitClient:
-    def __init__(self, api_key: str = None, api_secret: str = None, testnet: bool = False):
-        if api_key is None or api_secret is None:
-            api_key, api_secret = get_api_keys()
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
@@ -1678,203 +1627,17 @@ class BybitClient:
         self._cache_ttl = 5
         self._instrument_cache = {}
         self._instrument_cache_time = {}
-        self._instrument_cache_ttl = 3600
-        self._account_type = None  # Будет определено автоматически
+        self._instrument_cache_ttl = 3600  # 1 час
         self._init_session()
     
     def _init_session(self):
         try:
-            api_key, api_secret = get_api_keys()
-            if api_key and api_secret:
-                self.api_key = api_key
-                self.api_secret = api_secret
-                self.session = HTTP(testnet=self.testnet, api_key=self.api_key, api_secret=self.api_secret, recv_window=10000)
-                logger.info(f"Bybit session initialized (testnet={self.testnet})")
-            else:
-                logger.warning("API key or secret missing")
-                self.session = None
+            self.session = HTTP(testnet=self.testnet, api_key=self.api_key, api_secret=self.api_secret, recv_window=5000)
+            logger.info(f"Bybit session initialized (testnet={self.testnet})")
         except Exception as e:
             logger.error(f"Session init error: {e}")
-            self.session = None
-    
-    def _refresh_session(self):
-        logger.info("Refreshing Bybit session...")
-        self.session = None
-        self._init_session()
-        return self.session is not None
-    
-    def _is_api_available(self) -> bool:
-        if not self.session:
-            self._refresh_session()
-        return self.session is not None and self.api_key and self.api_secret
-    
-    async def detect_account_type(self) -> str:
-        """Автоматически определяет тип аккаунта (SPOT или UNIFIED)"""
-        if self._account_type and self._account_type != 'unknown':
-            return self._account_type
-        
-        if not self._is_api_available():
-            return 'unknown'
-        
-        try:
-            # Пробуем SPOT
-            logger.info("Checking SPOT account type...")
-            response = self.session.get_wallet_balance(accountType="SPOT")
-            if response['retCode'] == 0:
-                self._account_type = 'SPOT'
-                self.db.set_account_type('SPOT')
-                logger.info("✅ Account type detected: SPOT")
-                return 'SPOT'
-        except Exception as e:
-            logger.warning(f"SPOT check failed: {e}")
-        
-        try:
-            # Пробуем UNIFIED
-            logger.info("Checking UNIFIED account type...")
-            response = self.session.get_wallet_balance(accountType="UNIFIED")
-            if response['retCode'] == 0:
-                self._account_type = 'UNIFIED'
-                self.db.set_account_type('UNIFIED')
-                logger.info("✅ Account type detected: UNIFIED")
-                return 'UNIFIED'
-        except Exception as e:
-            logger.warning(f"UNIFIED check failed: {e}")
-        
-        self._account_type = 'unknown'
-        self.db.set_account_type('unknown')
-        logger.warning("⚠️ Could not detect account type")
-        return 'unknown'
-    
-    async def get_balance(self, coin: str = None) -> Dict:
-        if not self._is_api_available():
-            return {'error': 'API не доступен'}
-        
-        try:
-            if not self.session:
-                self._init_session()
-            
-            # Определяем тип аккаунта, если еще не определен
-            account_type = await self.detect_account_type()
-            
-            # Пробуем SPOT
-            if account_type == 'SPOT' or account_type == 'unknown':
-                try:
-                    response = self.session.get_wallet_balance(accountType="SPOT")
-                    if response['retCode'] == 0:
-                        result_list = response['result']['list']
-                        if result_list:
-                            account_data = result_list[0]
-                            coins = account_data.get('coin', [])
-                            
-                            if coin:
-                                for c in coins:
-                                    if c.get('coin') == coin:
-                                        wallet_balance = float(c.get('walletBalance', 0) or 0)
-                                        equity = float(c.get('equity', 0) or 0) or wallet_balance
-                                        locked = float(c.get('locked', 0) or 0)
-                                        available = wallet_balance - locked
-                                        usd_value = float(c.get('usdValue', 0) or 0)
-                                        logger.info(f"Balance for {coin} (SPOT): available={available}, equity={equity}")
-                                        return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
-                                
-                                logger.warning(f"Coin {coin} not found in SPOT response")
-                                return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
-                            else:
-                                total_equity = float(account_data.get('totalEquity', 0) or 0)
-                                return {'total_equity': total_equity, 'coins': coins}
-                except Exception as e:
-                    logger.warning(f"SPOT balance failed: {e}")
-            
-            # Пробуем UNIFIED
-            if account_type == 'UNIFIED' or account_type == 'unknown':
-                try:
-                    response = self.session.get_wallet_balance(accountType="UNIFIED")
-                    if response['retCode'] == 0:
-                        result_list = response['result']['list']
-                        if result_list:
-                            account_data = result_list[0]
-                            coins = account_data.get('coin', [])
-                            
-                            if coin:
-                                for c in coins:
-                                    if c.get('coin') == coin:
-                                        wallet_balance = float(c.get('walletBalance', 0) or 0)
-                                        equity = float(c.get('equity', 0) or 0) or wallet_balance
-                                        locked = float(c.get('locked', 0) or 0)
-                                        available = wallet_balance - locked
-                                        usd_value = float(c.get('usdValue', 0) or 0)
-                                        logger.info(f"Balance for {coin} (UNIFIED): available={available}, equity={equity}")
-                                        return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
-                                
-                                logger.warning(f"Coin {coin} not found in UNIFIED response")
-                                return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
-                            else:
-                                total_equity = float(account_data.get('totalEquity', 0) or 0)
-                                return {'total_equity': total_equity, 'coins': coins}
-                except Exception as e:
-                    logger.warning(f"UNIFIED balance failed: {e}")
-            
-            return {'error': 'Не удалось получить баланс'}
-            
-        except Exception as e:
-            logger.error(f"Error getting balance: {e}")
-            return {'error': str(e)}
-    
-    async def check_api_health(self) -> Dict:
-        self._refresh_session()
-        
-        if not self._is_api_available():
-            return {
-                'success': False,
-                'error': 'API ключи не настроены',
-                'user_message': 'API ключи не настроены в .env файле',
-                'is_api_error': True
-            }
-        
-        try:
-            if not self.session:
-                self._init_session()
-                if not self.session:
-                    return {
-                        'success': False,
-                        'error': 'Не удалось инициализировать сессию',
-                        'user_message': 'Ошибка инициализации API',
-                        'is_api_error': True
-                    }
-            
-            # Определяем тип аккаунта
-            account_type = await self.detect_account_type()
-            
-            # Получаем баланс для проверки
-            balance = await self.get_balance('USDT')
-            
-            if balance and 'error' not in balance:
-                return {
-                    'success': True,
-                    'message': 'API ключ работает',
-                    'account_type': account_type,
-                    'usdt_balance': balance.get('available', 0)
-                }
-            else:
-                return {
-                    'success': False,
-                    'error': balance.get('error', 'Неизвестная ошибка'),
-                    'user_message': 'Не удалось получить баланс. Проверьте права ключа.',
-                    'is_api_error': True
-                }
-                
-        except Exception as e:
-            logger.error(f"API health check error: {e}")
-            return {
-                'success': False,
-                'error': str(e),
-                'user_message': f'Ошибка соединения: {str(e)[:100]}',
-                'is_api_error': True
-            }
     
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
-        if not self._is_api_available():
-            return None
         now = time.time()
         if symbol in self._cache_time and now - self._cache_time.get(symbol, 0) < self._cache_ttl:
             return self._price_cache.get(symbol)
@@ -1893,8 +1656,6 @@ class BybitClient:
             return None
     
     async def cancel_all_sell_orders(self, symbol: str) -> Tuple[int, List[str]]:
-        if not self._is_api_available():
-            return 0, []
         try:
             open_orders = await self.get_open_orders(symbol)
             sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
@@ -1912,9 +1673,75 @@ class BybitClient:
             logger.error(f"Error cancelling sell orders: {e}")
             return 0, []
     
+    async def get_balance(self, coin: str = None) -> Dict:
+        """
+        Получение баланса с поддержкой UNIFIED аккаунтов (суб-аккаунты).
+        Bybit требует accountType="UNIFIED" для суб-аккаунтов.
+        """
+        try:
+            if not self.session:
+                self._init_session()
+            
+            # Пробуем UNIFIED (работает для всех аккаунтов, включая суб-аккаунты)
+            try:
+                response = self.session.get_wallet_balance(accountType="UNIFIED")
+                if response['retCode'] == 0:
+                    result_list = response['result']['list']
+                    if result_list:
+                        account_data = result_list[0]
+                        coins = account_data.get('coin', [])
+                        
+                        if coin:
+                            for c in coins:
+                                if c.get('coin') == coin:
+                                    wallet_balance = float(c.get('walletBalance', 0) or 0)
+                                    equity = float(c.get('equity', 0) or 0) or wallet_balance
+                                    locked = float(c.get('locked', 0) or 0)
+                                    available = wallet_balance - locked
+                                    usd_value = float(c.get('usdValue', 0) or 0)
+                                    logger.info(f"Balance for {coin} (UNIFIED): available={available}, equity={equity}")
+                                    return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
+                            
+                            logger.warning(f"Coin {coin} not found in UNIFIED response")
+                            # Если монета не найдена, возвращаем 0 баланс
+                            return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
+                        else:
+                            total_equity = float(account_data.get('totalEquity', 0) or 0)
+                            return {'total_equity': total_equity, 'coins': coins}
+            except Exception as e:
+                logger.warning(f"Error getting balance with UNIFIED: {e}")
+                # Если UNIFIED не сработал, пробуем SPOT
+                try:
+                    response = self.session.get_wallet_balance(accountType="SPOT")
+                    if response['retCode'] == 0:
+                        result_list = response['result']['list']
+                        if result_list:
+                            account_data = result_list[0]
+                            coins = account_data.get('coin', [])
+                            
+                            if coin:
+                                for c in coins:
+                                    if c.get('coin') == coin:
+                                        wallet_balance = float(c.get('walletBalance', 0) or 0)
+                                        equity = float(c.get('equity', 0) or 0) or wallet_balance
+                                        locked = float(c.get('locked', 0) or 0)
+                                        available = wallet_balance - locked
+                                        usd_value = float(c.get('usdValue', 0) or 0)
+                                        logger.info(f"Balance for {coin} (SPOT): available={available}, equity={equity}")
+                                        return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
+                            else:
+                                total_equity = float(account_data.get('totalEquity', 0) or 0)
+                                return {'total_equity': total_equity, 'coins': coins}
+                except Exception as e2:
+                    logger.warning(f"Error getting balance with SPOT: {e2}")
+            
+            return {'error': 'Не удалось получить баланс'}
+            
+        except Exception as e:
+            logger.error(f"Error getting balance: {e}")
+            return {'error': str(e)}
+    
     async def get_open_orders(self, symbol: str = None) -> List[Dict]:
-        if not self._is_api_available():
-            return []
         try:
             if not self.session:
                 self._init_session()
@@ -1940,8 +1767,6 @@ class BybitClient:
         return [o for o in orders if o.get('side') == 'Sell']
     
     async def get_order_history(self, symbol: str = None, limit: int = 500) -> List[Dict]:
-        if not self._is_api_available():
-            return []
         try:
             if not self.session:
                 self._init_session()
@@ -1957,9 +1782,7 @@ class BybitClient:
             return []
     
     async def get_instrument_info(self, symbol: str) -> Dict:
-        if not self._is_api_available():
-            return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'qty_decimals': 2, 'tick_size': 0.0001, 'price_decimals': 4}
-        
+        """Получение информации о инструменте с кешированием"""
         now = time.time()
         if symbol in self._instrument_cache_time and now - self._instrument_cache_time.get(symbol, 0) < self._instrument_cache_ttl:
             return self._instrument_cache.get(symbol, {})
@@ -2030,6 +1853,16 @@ class BybitClient:
         return round(rounded, decimals)
     
     def _round_quantity_for_sell(self, quantity: float, qty_decimals: int = SELL_DECIMALS_FALLBACK) -> float:
+        """
+        Округление количества для продажи с заданной точностью.
+        
+        Args:
+            quantity: Количество для округления
+            qty_decimals: Количество знаков после запятой (из инструмента)
+        
+        Returns:
+            Округленное количество
+        """
         if quantity <= 0:
             return 0.0
         
@@ -2039,8 +1872,6 @@ class BybitClient:
         return rounded
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
-        if not self._is_api_available():
-            return []
         try:
             check_date = from_date if from_date else get_moscow_time_naive() - timedelta(days=90)
             orders = await self.get_order_history(symbol, limit=500)
@@ -2083,8 +1914,6 @@ class BybitClient:
             return []
     
     async def get_completed_sell_orders(self, symbol: str = None, from_date: datetime = None) -> List[Dict]:
-        if not self._is_api_available():
-            return []
         try:
             check_date = from_date if from_date else get_moscow_time_naive() - timedelta(days=90)
             orders = await self.get_order_history(symbol, limit=500)
@@ -2126,8 +1955,6 @@ class BybitClient:
             return []
     
     async def cancel_order(self, symbol: str, order_id: str) -> Dict:
-        if not self._is_api_available():
-            return {'success': False, 'error': 'API не доступен'}
         try:
             if not self.session:
                 self._init_session()
@@ -2139,8 +1966,6 @@ class BybitClient:
             return {'success': False, 'error': str(e)}
     
     async def amend_order_price(self, symbol: str, order_id: str, new_price: float) -> Dict:
-        if not self._is_api_available():
-            return {'success': False, 'error': 'API не доступен'}
         try:
             if not self.session:
                 self._init_session()
@@ -2152,8 +1977,6 @@ class BybitClient:
             return {'success': False, 'error': str(e)}
     
     async def place_limit_sell(self, symbol: str, quantity: float, price: float) -> Dict:
-        if not self._is_api_available():
-            return {'success': False, 'error': 'API не доступен'}
         try:
             if not self.session:
                 self._init_session()
@@ -2165,6 +1988,7 @@ class BybitClient:
             
             rounded_price = self._round_price_by_tick(price, tick_size)
             
+            # Используем точность из инструмента
             rounded_quantity = self._round_quantity_for_sell(quantity, qty_decimals)
             
             if rounded_quantity < min_qty and quantity >= min_qty:
@@ -2198,6 +2022,7 @@ class BybitClient:
             if response['retCode'] == 170131:
                 return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
             if response['retCode'] == 170137:
+                # Пробуем уменьшить точность
                 for decimals in range(qty_decimals - 1, 0, -1):
                     factor = 10 ** decimals
                     retry_quantity = math.floor(rounded_quantity * factor) / factor
@@ -2211,8 +2036,6 @@ class BybitClient:
             return {'success': False, 'error': str(e)}
     
     async def place_limit_buy(self, symbol: str, price: float, amount_usdt: float, is_auto: bool = True) -> Dict:
-        if not self._is_api_available():
-            return {'success': False, 'error': 'API не доступен'}
         try:
             if not self.session:
                 self._init_session()
@@ -2298,8 +2121,11 @@ class DCAStrategy:
             f"✅ Ордер активен!"
         )
         
-        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
-        logger.info(f"Sell order notification sent")
+        try:
+            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+            logger.info(f"Sell order notification sent")
+        except Exception as e:
+            logger.error(f"Error sending notification: {e}")
     
     async def _send_no_sell_order_notification(self, symbol: str, reason: str, bot):
         user_id = self.db.get_authorized_user_id()
@@ -2313,8 +2139,11 @@ class DCAStrategy:
             f"🔄 Проверка будет выполнена через 1 час."
         )
         
-        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
-        logger.info(f"No sell order notification sent")
+        try:
+            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+            logger.info(f"No sell order notification sent")
+        except Exception as e:
+            logger.error(f"Error sending notification: {e}")
     
     async def _send_sell_order_removed_notification(self, symbol: str, bot):
         user_id = self.db.get_authorized_user_id()
@@ -2329,8 +2158,11 @@ class DCAStrategy:
             f"✅ Новый ордер будет создан с +5% прибыли."
         )
         
-        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
-        logger.info(f"Sell order removed notification sent")
+        try:
+            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+            logger.info(f"Sell order removed notification sent")
+        except Exception as e:
+            logger.error(f"Error sending notification: {e}")
     
     async def _send_purchase_skipped_notification(self, symbol: str, reason: str, current_price: float, avg_price: float, bot):
         user_id = self.db.get_authorized_user_id()
@@ -2346,15 +2178,20 @@ class DCAStrategy:
             f"🔄 Следующая проверка по расписанию."
         )
         
-        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
-        logger.info(f"Purchase skipped notification sent: {reason}")
+        try:
+            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+            logger.info(f"Purchase skipped notification sent: {reason}")
+        except Exception as e:
+            logger.error(f"Error sending purchase skipped notification: {e}")
     
     async def check_and_create_sell_order(self, symbol: str, bot, silent: bool = False) -> Dict:
+        """Проверяет и создает ордер на продажу ТОЛЬКО если есть покупки"""
         try:
             coin = symbol.replace('USDT', '')
             
             stats = self.db.get_dca_stats(symbol)
             
+            # Если нет покупок - не создаем ордер на продажу
             if not stats or stats['total_quantity'] <= 0:
                 error_msg = 'Нет статистики DCA для расчета цены (нет покупок)'
                 logger.info(f"No purchases for {symbol}, skipping sell order creation")
@@ -2374,6 +2211,7 @@ class DCAStrategy:
                 return {'success': False, 'error': error_msg}
             
             actual_balance = balance_info.get('equity', 0)
+            
             logger.info(f"Balance {coin}: available={balance_info.get('available', 0)}, equity={actual_balance}")
             
             if actual_balance <= 0:
@@ -2702,6 +2540,7 @@ class DCAStrategy:
                 'reason': f'Минимальная сумма ордера: {min_amt} USDT'
             }
         elif result.get('error') == 'quantity_decimals_error':
+            # Пробуем уменьшить точность
             for decimals in range(qty_decimals - 1, 0, -1):
                 factor = 10 ** decimals
                 retry_quantity = math.floor(rounded_quantity * factor) / factor
@@ -2765,8 +2604,11 @@ class DCAStrategy:
             f"✅ Ордер сохранен и будет автоматически восстановлен."
         )
         
-        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
-        logger.info(f"Failed sell notification sent")
+        try:
+            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+            logger.info(f"Failed sell notification sent")
+        except Exception as e:
+            logger.error(f"Error sending failed sell notification: {e}")
     
     async def _send_pending_sell_notification(self, symbol: str, quantity: float, target_price: float, profit_percent: float, reason: str, bot):
         user_id = self.db.get_authorized_user_id()
@@ -2785,13 +2627,13 @@ class DCAStrategy:
             f"✅ Ордер сохранен и будет автоматически выставлен при возможности."
         )
         
-        await safe_send_message(bot, user_id, message, parse_mode='Markdown')
-        logger.info(f"Pending sell notification sent")
+        try:
+            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+            logger.info(f"Pending sell notification sent")
+        except Exception as e:
+            logger.error(f"Error sending pending sell notification: {e}")
     
     async def execute_scheduled_purchase(self, symbol: str, profit_percent: float, bot) -> Dict:
-        if not self.bybit._is_api_available():
-            return {'success': False, 'error': 'API Bybit не доступен (проверьте ключи в .env)'}
-        
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
             return {'success': False, 'error': 'Не удалось получить цену'}
@@ -3094,6 +2936,7 @@ class DCAStrategy:
                 if rounded_price <= 0:
                     rounded_price = tick_size
                 
+                # Обновляем количество с правильной точностью
                 quantity = self.bybit._round_quantity_for_sell(order['quantity'], qty_decimals)
                 
                 sell_result = await self._try_place_sell_order(symbol, quantity, rounded_price, order['profit_percent'], bot)
@@ -3124,8 +2967,11 @@ class DCAStrategy:
                            f"💰 Цена продажи: `{format_price(rounded_price, 4)}` USDT\n"
                            f"📈 Целевая прибыль: `{order['profit_percent']}%`\n\n"
                            f"✅ Ордер успешно выставлен!")
-                    await safe_send_message(bot, user_id, msg, parse_mode='Markdown')
-                    logger.info(f"Sent pending order notification for {symbol} to user {user_id}")
+                    try:
+                        await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+                        logger.info(f"Sent pending order notification for {symbol} to user {user_id}")
+                    except Exception as e:
+                        logger.error(f"Error sending pending order notification: {e}")
                 elif sell_result.get('pending'):
                     fail_reason = sell_result.get('reason', 'Неизвестная причина')
                     self.db.update_pending_sell_retry(order['id'], fail_reason)
@@ -3300,9 +3146,12 @@ class DCAStrategy:
                 [InlineKeyboardButton("✅ Да, очистить статистику сейчас", callback_data=f"confirm_clear_stats_{symbol}_{sell['id']}"),
                  InlineKeyboardButton("❌ Нет, оставить", callback_data=f"skip_clear_stats_{symbol}_{sell['id']}")]
             ])
-            await safe_send_message(bot, user_id, message, parse_mode='HTML', reply_markup=keyboard)
-            logger.info(f"Sent completed sell notification for {symbol} to user {user_id}")
-            self.db.mark_completed_sell_notified(sell['id'])
+            try:
+                await bot.send_message(chat_id=user_id, text=message, parse_mode='HTML', reply_markup=keyboard)
+                logger.info(f"Sent completed sell notification for {symbol} to user {user_id}")
+                self.db.mark_completed_sell_notified(sell['id'])
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
         
         return our_completed
     
@@ -3329,12 +3178,18 @@ class DCAStrategy:
                 self.db.log_action('AUTO_STATS_CLEARED', sym, f"Автоматическая очистка после дедлайна, удалено {deleted_count} покупок")
                 self.db.mark_completed_sell_stats_cleared(sell_id)
                 
-                msg = (f"🔄 *Автоматическая очистка статистики*\n\n"
-                       f"🪙 Токен: `{sym}`\n"
-                       f"🗑 Удалено покупок: `{deleted_count}`\n\n"
-                       f"📊 Начинаем новый цикл накопления.")
-                await safe_send_message(bot, user_id, msg, parse_mode='Markdown')
-                logger.info(f"Auto cleared stats for {sym}")
+                try:
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=f"🔄 *Автоматическая очистка статистики*\n\n"
+                             f"🪙 Токен: `{sym}`\n"
+                             f"🗑 Удалено покупок: `{deleted_count}`\n\n"
+                             f"📊 Начинаем новый цикл накопления.",
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"Auto cleared stats for {sym}")
+                except Exception as e:
+                    logger.error(f"Error sending auto-clear notification: {e}")
     
     async def get_recommended_purchase(self, symbol: str) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
@@ -3436,9 +3291,14 @@ class DCAStrategy:
                 InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
                 InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
             ]])
-            if user_id:
-                await safe_send_message(bot, user_id, msg, parse_mode='Markdown', reply_markup=keyboard)
-                logger.info(f"Sent order notification for {order['order_id']} to user {user_id}")
+            try:
+                if user_id:
+                    await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
+                    logger.info(f"Sent order notification for {order['order_id']} to user {user_id}")
+                else:
+                    logger.error(f"Cannot send notification: user_id is None")
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
         
         return new_orders
     
@@ -3507,9 +3367,14 @@ class DCAStrategy:
                 InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
                 InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
             ]])
-            if user_id:
-                await safe_send_message(bot, user_id, msg, parse_mode='Markdown', reply_markup=keyboard)
-                logger.info(f"Sent full-check order notification for {order['order_id']} to user {user_id}")
+            try:
+                if user_id:
+                    await bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown', reply_markup=keyboard)
+                    logger.info(f"Sent full-check order notification for {order['order_id']} to user {user_id}")
+                else:
+                    logger.error("Cannot send full-check notification: user_id is None")
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
         
         self.db.set_last_full_check_time(get_moscow_time_naive())
         return missing_orders
@@ -3832,6 +3697,7 @@ class DCAStrategy:
                     await update.message.reply_text(msg, parse_mode='Markdown')
                 return {'success': False, 'pending': True, 'pending_id': pending_id, 'error': result.get('error'), 'message': msg}
             elif result.get('error') == 'quantity_decimals_error':
+                # Пробуем уменьшить точность
                 for decimals in range(qty_decimals - 1, 0, -1):
                     factor = 10 ** decimals
                     retry_qty = math.floor(sell_qty * factor) / factor
@@ -3873,10 +3739,6 @@ class FastDCABot:
         self.scheduler_running = False
         self.background_tasks = []
         self._sell_check_task = None
-        self._api_check_task = None
-        self._api_was_working = False
-        self._api_error_count = 0
-        self._is_running = False
         
         request_kwargs = {'connect_timeout': 60.0, 'read_timeout': 60.0, 'write_timeout': 60.0, 'pool_timeout': 60.0}
         request = HTTPXRequest(**request_kwargs)
@@ -3888,236 +3750,16 @@ class FastDCABot:
         
         self.setup_handlers()
     
-    def _init_bybit(self, force_reload: bool = False):
-        api_key, api_secret = get_api_keys()
-        
-        if not api_key or not api_secret:
-            logger.warning("API keys missing in .env")
-            self.bybit_initialized = False
-            self.bybit = None
-            return
-        
-        try:
-            testnet = self.db.is_demo_mode()
-            self.bybit = BybitClient(api_key, api_secret, testnet)
-            self.strategy = DCAStrategy(self.db, self.bybit)
-            self.bybit_initialized = True
-            logger.info(f"Bybit client initialized with fresh keys (demo={testnet})")
-        except Exception as e:
-            logger.error(f"Bybit init error: {e}")
-            self.bybit_initialized = False
-    
-    def refresh_api_session(self):
-        logger.info("Refreshing API session...")
-        self.bybit_initialized = False
-        self.bybit = None
-        self._init_bybit(force_reload=True)
-        return self.bybit_initialized
-    
-    async def check_api_and_notify(self, is_startup: bool = False) -> bool:
-        self.refresh_api_session()
-        
-        if not self.bybit_initialized:
-            self._init_bybit()
-            if not self.bybit_initialized:
-                return False
-        
-        health = await self.bybit.check_api_health()
-        user_id = self.authorized_user_id
-        
-        if health['success']:
-            if not self._api_was_working:
-                self._api_was_working = True
-                self._api_error_count = 0
-                self.db.set_api_status('working')
-                self.db.set_api_error_message('')
-                
-                account_type = health.get('account_type', 'unknown')
-                usdt_balance = health.get('usdt_balance', 0)
-                
-                if user_id and not is_startup:
-                    message = (
-                        "✅ *API Bybit восстановлен!*\n\n"
-                        "🔑 Ключи работают корректно.\n"
-                        f"📊 Тип аккаунта: `{account_type}`\n"
-                        f"💵 USDT доступно: `{usdt_balance:.2f}`\n"
-                        "🕐 Время проверки: `{}`"
-                    ).format(get_moscow_time().strftime('%H:%M:%S'))
-                    await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
-                    logger.info("API recovery notification sent")
-            return True
-        else:
-            self._api_was_working = False
-            self._api_error_count += 1
-            self.db.set_api_status('error')
-            self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
-            
-            if user_id and (is_startup or self._api_error_count % 3 == 0):
-                error_code = health.get('error_code', 'N/A')
-                user_message = health.get('user_message', 'Неизвестная ошибка')
-                
-                message = (
-                    "🚨 *ОШИБКА API BYBIT!*\n\n"
-                    "❌ Статус: НЕ РАБОТАЕТ\n"
-                    "📝 Ошибка: {}\n"
-                    "🔢 Код: {}\n\n"
-                    "⚠️ *Что делать:*\n"
-                    "1️⃣ Проверьте API ключ в файле `.env`\n"
-                    "2️⃣ Убедитесь, что ключ активен\n"
-                    "3️⃣ Проверьте права доступа\n"
-                    "4️⃣ Проверьте IP в белом списке Bybit\n\n"
-                    "🔄 Бот будет проверять доступ каждые 6 часов."
-                ).format(user_message, error_code)
-                await safe_send_message(self.application.bot, user_id, message, parse_mode='Markdown')
-                logger.info(f"API error notification sent (attempt {self._api_error_count})")
-            return False
-    
-    async def cmd_check_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        
-        await update.message.reply_text("🔍 Проверяю API ключ...")
-        
-        self.refresh_api_session()
-        
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ API не инициализирован. Проверьте .env файл.")
-            return
-        
-        health = await self.bybit.check_api_health()
-        
-        if health['success']:
-            self._api_was_working = True
-            self.db.set_api_status('working')
-            self.db.set_api_error_message('')
-            account_type = health.get('account_type', 'unknown')
-            usdt_balance = health.get('usdt_balance', 0)
-            message = (
-                "✅ *API Bybit работает корректно!*\n\n"
-                "🔑 Ключ активен и имеет необходимые права.\n"
-                f"📊 Тип аккаунта: `{account_type}`\n"
-                f"💵 USDT доступно: `{usdt_balance:.2f}`\n"
-                "🕐 Время проверки: `{}`"
-            ).format(get_moscow_time().strftime('%H:%M:%S'))
-            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
-        else:
-            error_code = health.get('error_code', 'N/A')
-            user_message = health.get('user_message', 'Неизвестная ошибка')
-            
-            message = (
-                "🚨 *КРИТИЧЕСКАЯ ОШИБКА API BYBIT!*\n\n"
-                "❌ Статус: `НЕ РАБОТАЕТ`\n"
-                "📝 Ошибка: `{}`\n"
-                "🔢 Код: `{}`\n\n"
-                "⚠️ *Что делать:*\n"
-                "1️⃣ Проверьте API ключ в файле `.env`\n"
-                "2️⃣ Убедитесь, что ключ активен (выдается на 90 дней)\n"
-                "3️⃣ Проверьте права доступа (нужны: spot trade, wallet read)\n"
-                "4️⃣ Проверьте IP в белом списке Bybit"
-            ).format(user_message, error_code)
-            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
-    
-    async def cmd_account_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда для отображения информации об аккаунте"""
-        if not await self._check_user_fast(update):
-            return
-        
-        self._init_bybit()
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ API не инициализирован.")
-            return
-        
-        await update.message.reply_text("🔍 Определяю тип аккаунта...")
-        
-        account_type = await self.bybit.detect_account_type()
-        
-        # Получаем баланс USDT
-        balance = await self.bybit.get_balance('USDT')
-        usdt_available = balance.get('available', 0) if balance else 0
-        
-        # Получаем баланс основного токена
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
-        coin = symbol.replace('USDT', '')
-        coin_balance = await self.bybit.get_balance(coin)
-        coin_available = coin_balance.get('available', 0) if coin_balance else 0
-        coin_equity = coin_balance.get('equity', 0) if coin_balance else 0
-        
-        await update.message.reply_text(
-            f"📊 *Информация об аккаунте*\n\n"
-            f"🔑 Тип аккаунта: `{account_type}`\n"
-            f"💵 USDT доступно: `{usdt_available:.2f}`\n"
-            f"🪙 {coin} доступно: `{format_quantity(coin_available, 5)}`\n"
-            f"🪙 {coin} всего: `{format_quantity(coin_equity, 5)}`\n"
-            f"🪙 Токен: `{symbol}`\n\n"
-            f"✅ API-ключ привязан к аккаунту типа {account_type}\n"
-            f"🔄 Бот автоматически работает с этим аккаунтом.",
-            parse_mode='Markdown'
-        )
-    
-    async def cmd_refresh_api(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_user_fast(update):
-            return
-        
-        await update.message.reply_text("🔄 Обновляю API ключи из .env...")
-        
-        load_dotenv()
-        api_key = os.getenv('BYBIT_API_KEY')
-        api_secret = os.getenv('BYBIT_API_SECRET')
-        
-        if not api_key or not api_secret:
-            await update.message.reply_text("❌ Ключи не найдены в .env файле!")
-            return
-        
-        await update.message.reply_text(f"✅ Ключи найдены:\nAPI Key: {api_key[:8]}...{api_key[-4:]}")
-        
-        self.refresh_api_session()
-        
-        if not self.bybit_initialized:
-            await update.message.reply_text("❌ Не удалось создать сессию Bybit")
-            return
-        
-        await update.message.reply_text("🔍 Проверяю работоспособность ключей...")
-        health = await self.bybit.check_api_health()
-        
-        if health['success']:
-            self._api_was_working = True
-            self.db.set_api_status('working')
-            self.db.set_api_error_message('')
-            account_type = health.get('account_type', 'unknown')
-            await update.message.reply_text(
-                f"✅ *API Bybit работает корректно!*\n\n"
-                f"🔑 Ключи актуальны и имеют необходимые права.\n"
-                f"📊 Тип аккаунта: `{account_type}`",
-                parse_mode='Markdown'
-            )
-        else:
-            error_code = health.get('error_code', 'N/A')
-            user_message = health.get('user_message', 'Неизвестная ошибка')
-            message = (
-                "❌ *Ошибка API*\n\n"
-                "📝 {}\n"
-                "🔢 Код: {}\n\n"
-                "Проверьте ключи в .env файле."
-            ).format(user_message, error_code)
-            await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
-    
-    async def _check_user_fast(self, update: Update) -> bool:
-        user = update.effective_user
-        username = f"@{user.username}" if user.username else f"ID:{user.id}"
-        if self.authorized_user_id is None:
-            if username == AUTHORIZED_USER:
-                self.authorized_user_id = user.id
-                self.db.set_authorized_user_id(user.id)
-                logger.info(f"Authorized user ID saved: {user.id}")
-                return True
-        elif user.id == self.authorized_user_id:
-            return True
-        await update.message.reply_text("⛔ Доступ запрещен")
-        return False
-    
-    async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data.clear()
-        self.import_waiting = False
+    def _init_bybit(self):
+        if not self.bybit_initialized and BYBIT_API_KEY and BYBIT_API_SECRET:
+            try:
+                testnet = self.db.is_demo_mode()
+                self.bybit = BybitClient(BYBIT_API_KEY, BYBIT_API_SECRET, testnet)
+                self.strategy = DCAStrategy(self.db, self.bybit)
+                self.bybit_initialized = True
+                logger.info(f"Bybit client initialized (demo={testnet})")
+            except Exception as e:
+                logger.error(f"Bybit init error: {e}")
     
     def get_main_keyboard(self):
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
@@ -4189,7 +3831,6 @@ class FastDCABot:
         mode = self.db.get_trading_mode()
         mode_button = "🌐 Режим: Демо" if mode == 'demo' else "🌐 Режим: Обычный"
         manual_amount = self.db.get_manual_amount()
-        account_type = self.db.get_account_type()
         keyboard = [
             [KeyboardButton("🪙 Выбор токена"), KeyboardButton("🚀 Настройки Авто DCA")],
             [KeyboardButton("📊 Процент прибыли"), KeyboardButton("🪜 Лестница Мартингейла")],
@@ -4227,6 +3868,12 @@ class FastDCABot:
     def get_confirm_delete_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("✅ Да, удалить"), KeyboardButton("❌ Нет, отмена")]], resize_keyboard=True)
     
+    def get_clear_stats_keyboard(self):
+        return ReplyKeyboardMarkup([
+            [KeyboardButton("✅ Да, очистить статистику")],
+            [KeyboardButton("❌ Нет, оставить")]
+        ], resize_keyboard=True)
+    
     def get_purchases_list_keyboard(self, purchases):
         keyboard = []
         for p in purchases:
@@ -4241,6 +3888,24 @@ class FastDCABot:
     
     def get_manual_buy_keyboard(self):
         return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    
+    async def _check_user_fast(self, update: Update) -> bool:
+        user = update.effective_user
+        username = f"@{user.username}" if user.username else f"ID:{user.id}"
+        if self.authorized_user_id is None:
+            if username == AUTHORIZED_USER:
+                self.authorized_user_id = user.id
+                self.db.set_authorized_user_id(user.id)
+                logger.info(f"Authorized user ID saved: {user.id}")
+                return True
+        elif user.id == self.authorized_user_id:
+            return True
+        await update.message.reply_text("⛔ Доступ запрещен")
+        return False
+    
+    async def _reset_bot_state(self, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.clear()
+        self.import_waiting = False
     
     async def _end_conversation_gracefully(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
@@ -4278,47 +3943,15 @@ class FastDCABot:
         current_time = get_moscow_time()
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
-        
-        api_status_text = "❌ НЕ РАБОТАЕТ"
-        health = None
-        self._init_bybit()
-        if self.bybit_initialized:
-            health = await self.bybit.check_api_health()
-            if health['success']:
-                api_status_text = "✅ РАБОТАЕТ"
-                self._api_was_working = True
-                self.db.set_api_status('working')
-                account_type = health.get('account_type', 'unknown')
-                self.db.set_account_type(account_type)
-            else:
-                api_status_text = f"❌ {health.get('user_message', 'Ошибка')}"
-                self._api_was_working = False
-                self.db.set_api_status('error')
-                self.db.set_api_error_message(health.get('user_message', 'Неизвестная ошибка'))
-        
-        status_emoji = api_status_text.split()[0] if api_status_text.split() else api_status_text
-        account_type = self.db.get_account_type()
-        
-        start_message = (
+        await update.message.reply_text(
             f"👋 Привет, {update.effective_user.first_name}!\n\n"
             f"🤖 DCA Bybit Bot (Мартингейл лесенкой)\n"
             f"📌 Версия: {BOT_VERSION}\n"
             f"🌐 Режим: {mode_text}\n"
-            f"📊 Тип аккаунта: {account_type if account_type != 'unknown' else '🔍 Определяется...'}\n"
             f"🕐 Московское время: {current_time.strftime('%H:%M')}\n\n"
-            f"🔑 *Статус API Bybit:* {api_status_text}\n\n"
-            f"✅ Бот запущен и готов к работе!\n"
-            f"🌐 Доступ к бирже Bybit по API ключу {status_emoji}\n\n"
-            f"📋 Уведомления об исполненных ордерах будут приходить сюда.\n"
-            f"🔄 Проверка API выполняется каждые 6 часов.\n\n"
-            f"ℹ️ Команда /account_info - показать информацию об аккаунте"
+            f"Главное меню:",
+            reply_markup=self.get_main_keyboard()
         )
-        
-        await safe_send_message(self.application.bot, update.effective_user.id, start_message, parse_mode='Markdown', reply_markup=self.get_main_keyboard())
-        
-        if self.bybit_initialized and health and not health['success']:
-            await self.check_api_and_notify(is_startup=True)
-        
         if self.authorized_user_id:
             try:
                 await self.application.bot.send_message(
@@ -4341,7 +3974,7 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return
         
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         
         try:
             first_order_date = self.db.get_first_order_date()
@@ -4480,7 +4113,7 @@ class FastDCABot:
             if amount < 5:
                 raise ValueError("Минимальная сумма 5 USDT")
             self.db.set_setting('invest_amount', str(amount))
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             ladder = self.db.get_ladder_settings(symbol)
             ladder['base_amount'] = amount
             ladder['max_amount'] = amount * 3
@@ -4792,7 +4425,7 @@ class FastDCABot:
             await msg.edit_text("❌ Bybit API не инициализирован.")
             return NOTIFICATION_SETTINGS_MENU
         
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         first_order_date = self.db.get_first_order_date()
         check_date_str = first_order_date.strftime('%d.%m.%Y') if first_order_date else "начала торгов"
         
@@ -4826,9 +4459,12 @@ class FastDCABot:
                 InlineKeyboardButton("✅ Добавить", callback_data=f"add_order_{order['order_id']}"),
                 InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_order_{order['order_id']}")
             ]])
-            await safe_send_message(self.application.bot, self.authorized_user_id, msg_text, parse_mode='Markdown', reply_markup=keyboard)
-            notified_count += 1
-            await asyncio.sleep(0.3)
+            try:
+                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg_text, parse_mode='Markdown', reply_markup=keyboard)
+                notified_count += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
         
         for sell in sell_result['missing']:
             profit_emoji = "🟢" if sell['profit_usdt'] >= 0 else "🔴"
@@ -4848,8 +4484,11 @@ class FastDCABot:
                 InlineKeyboardButton("✅ Да, очистить", callback_data=f"confirm_clear_stats_{symbol}_{sell['id']}"),
                 InlineKeyboardButton("❌ Нет, оставить", callback_data=f"skip_clear_stats_{symbol}_{sell['id']}")
             ]])
-            await safe_send_message(self.application.bot, self.authorized_user_id, msg_text, parse_mode='Markdown', reply_markup=keyboard)
-            await asyncio.sleep(0.3)
+            try:
+                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg_text, parse_mode='Markdown', reply_markup=keyboard)
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
         
         if notified_count == 0 and not sell_result['missing']:
             await self.application.bot.send_message(chat_id=self.authorized_user_id, text="✨ *Отлично!* Все ордера синхронизированы.", parse_mode='Markdown')
@@ -4868,7 +4507,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         try:
             orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
             sell_count = len(orders_by_side.get('sell', []))
@@ -4896,7 +4535,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
             return
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         coin = symbol.replace('USDT', '')
         try:
             orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
@@ -4939,7 +4578,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         try:
             orders_by_side = await self.bybit.get_open_orders_by_side(symbol)
             all_orders = []
@@ -4979,7 +4618,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.", reply_markup=self.get_order_management_keyboard())
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         try:
             all_orders = context.user_data.get('cancel_orders', [])
             if not all_orders:
@@ -5038,7 +4677,7 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return
         try:
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             coin = symbol.replace('USDT', '')
             coin_balance = await self.bybit.get_balance(coin)
             usdt_balance = await self.bybit.get_balance('USDT')
@@ -5084,7 +4723,7 @@ class FastDCABot:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return
         try:
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             coin = symbol.replace('USDT', '')
             stats = self.db.get_dca_stats(symbol)
             current_price = await self.bybit.get_symbol_price(symbol)
@@ -5141,7 +4780,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return
         await self._reset_bot_state(context)
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
         invest_amount = float(self.db.get_setting('invest_amount', '5.0'))
         manual_amount = self.db.get_manual_amount()
@@ -5157,15 +4796,8 @@ class FastDCABot:
         next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
-        api_status = self.db.get_api_status()
-        api_error = self.db.get_api_error_message()
-        account_type = self.db.get_account_type()
-        api_status_text = "✅ Работает" if api_status == 'working' else f"❌ {api_error if api_error else 'Неизвестно'}"
-        
         message = f"📋 *Статус бота*\n\n"
         message += f"🌐 Режим: {mode_text}\n"
-        message += f"📊 Тип аккаунта: {account_type if account_type != 'unknown' else '🔍 Определяется...'}\n"
-        message += f"🔑 API Bybit: {api_status_text}\n"
         message += f"🤖 Статус: {'✅ Активен' if is_active else '⏹ Остановлен'}\n"
         if is_active and next_purchase_str:
             try:
@@ -5193,7 +4825,7 @@ class FastDCABot:
         stats = self.db.get_dca_stats(symbol)
         if stats:
             message += f"\n📊 Всего покупок: `{stats['total_purchases']}`\n💰 Вложено: `{stats['total_usdt']:.2f}` USDT"
-        await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
+        await update.message.reply_text(message, parse_mode='Markdown')
     
     async def toggle_dca(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
@@ -5219,7 +4851,7 @@ class FastDCABot:
             )
             logger.info("DCA stopped by user")
         else:
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             current_price = await self.bybit.get_symbol_price(symbol)
             if not current_price:
                 await update.message.reply_text("❌ Не удалось получить цену")
@@ -5235,6 +4867,7 @@ class FastDCABot:
                 parse_mode='Markdown'
             )
             
+            # Проверяем наличие покупок перед созданием ордера
             stats = self.db.get_dca_stats(symbol)
             if not stats or stats['total_quantity'] <= 0:
                 await update.message.reply_text(
@@ -5295,19 +4928,17 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         await self._reset_bot_state(context)
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         profit_percent = self.db.get_setting('profit_percent', '5')
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
         manual_amount = self.db.get_manual_amount()
-        account_type = self.db.get_account_type()
         await update.message.reply_text(
             f"⚙️ *Настройки*\n\n"
             f"🪙 Токен: `{symbol}`\n"
             f"📈 Цель: `{profit_percent}%`\n"
             f"💵 Сумма для ручного ордера: `{manual_amount}` USDT\n"
-            f"🌐 Режим: {mode_text}\n"
-            f"📊 Тип аккаунта: {account_type if account_type != 'unknown' else '🔍 Определяется...'}\n\n"
+            f"🌐 Режим: {mode_text}\n\n"
             f"Выберите раздел:",
             reply_markup=self.get_settings_keyboard(),
             parse_mode='Markdown'
@@ -5336,7 +4967,7 @@ class FastDCABot:
     async def set_symbol_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return SELECTING_ACTION
-        await update.message.reply_text(f"🪙 Выберите токен или введите свой\nТекущий: {self.db.get_setting('symbol', DEFAULT_SYMBOL)}", reply_markup=self.get_symbol_selection_keyboard())
+        await update.message.reply_text(f"🪙 Выберите токен или введите свой\nТекущий: {self.db.get_setting('symbol', 'TONUSDT')}", reply_markup=self.get_symbol_selection_keyboard())
         return SELECTING_SYMBOL
     
     async def process_symbol_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5408,7 +5039,7 @@ class FastDCABot:
     async def show_ladder_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         ladder = self.db.get_ladder_settings(symbol)
         current_price = await self.bybit.get_symbol_price(symbol) if self.bybit_initialized else None
         summary = self.db.get_ladder_summary(symbol, current_price)
@@ -5447,7 +5078,7 @@ class FastDCABot:
             max_depth = float(text.replace(',', '.'))
             if max_depth < 30 or max_depth > 95:
                 raise ValueError
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             ladder = self.db.get_ladder_settings(symbol)
             ladder['max_depth'] = max_depth
             self.db.save_ladder_settings(ladder)
@@ -5472,7 +5103,7 @@ class FastDCABot:
             base_amount = float(text.replace(',', '.'))
             if base_amount < 5:
                 raise ValueError("Минимальная сумма 5 USDT")
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             ladder = self.db.get_ladder_settings(symbol)
             ladder['base_amount'] = base_amount
             ladder['max_amount'] = base_amount * 3
@@ -5486,11 +5117,12 @@ class FastDCABot:
     async def reset_ladder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return LADDER_MENU
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         self.db.reset_ladder(symbol)
         await update.message.reply_text("🔄 Статистика DCA очищена! Лестница сброшена.\n⚠️ ID покупок будут начинаться с 1 при следующем добавлении.", reply_markup=self.get_ladder_settings_keyboard())
         return LADDER_MENU
     
+    # Ручные покупки
     async def manual_buy_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -5499,7 +5131,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
             await update.message.reply_text("❌ Не удалось получить цену", reply_markup=self.get_main_keyboard())
@@ -5567,7 +5199,7 @@ class FastDCABot:
             if amount < 1.1:
                 raise ValueError("Минимальная сумма 1.1 USDT")
             price = context.user_data.get('manual_buy_price')
-            symbol = context.user_data.get('manual_buy_symbol', DEFAULT_SYMBOL)
+            symbol = context.user_data.get('manual_buy_symbol', 'TONUSDT')
             recommendation = context.user_data.get('manual_buy_recommendation', {})
             if not price:
                 await update.message.reply_text("❌ Ошибка", reply_markup=self.get_main_keyboard())
@@ -5615,6 +5247,7 @@ class FastDCABot:
             return MANUAL_BUY_AMOUNT
         return ConversationHandler.END
     
+    # Добавление покупки вручную
     async def manual_add_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
@@ -5623,7 +5256,7 @@ class FastDCABot:
         if not self.bybit_initialized:
             await update.message.reply_text("❌ Bybit API не инициализирован.")
             return ConversationHandler.END
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         current_price = await self.bybit.get_symbol_price(symbol)
         stats = self.db.get_dca_stats(symbol)
         
@@ -5664,7 +5297,7 @@ class FastDCABot:
             if price <= 0:
                 raise ValueError("Цена должна быть положительной")
             context.user_data['manual_price'] = price
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             stats = self.db.get_dca_stats(symbol)
             
             recommendation = self.db.get_recommendation_for_current_drop(price, symbol, for_manual=True)
@@ -5712,7 +5345,7 @@ class FastDCABot:
                 await self._reset_bot_state(context)
                 await update.message.reply_text("❌ Ошибка: цена не найдена. Попробуйте заново.", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             amount_usdt = price * quantity
             stats = self.db.get_dca_stats(symbol)
             drop_percent = 0
@@ -5733,12 +5366,13 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка! Введите корректное количество.\nПример: 10.5 или 10,5\n\nОшибка: {str(e)}", reply_markup=self.get_cancel_keyboard())
             return MANUAL_ADD_AMOUNT
     
+    # Редактирование покупок
     async def edit_purchases_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         await self._reset_bot_state(context)
         context.user_data.pop('editing_purchase_id', None)
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         purchases = self.db.get_purchases(symbol)
         if not purchases:
             await update.message.reply_text("Нет покупок", reply_markup=self.get_main_keyboard())
@@ -5760,7 +5394,7 @@ class FastDCABot:
             import re
             match = re.search(r'ID(\d+)', text)
             if not match:
-                await update.message.reply_text("❌ Неверный формат.", reply_markup=self.get_purchases_list_keyboard(self.db.get_purchases(self.db.get_setting('symbol', DEFAULT_SYMBOL))))
+                await update.message.reply_text("❌ Неверный формат.", reply_markup=self.get_purchases_list_keyboard(self.db.get_purchases(self.db.get_setting('symbol', 'TONUSDT'))))
                 return EDIT_PURCHASE_SELECT
             purchase_id = int(match.group(1))
             purchase = self.db.get_purchase_by_id(purchase_id)
@@ -5798,7 +5432,7 @@ class FastDCABot:
                 await update.message.reply_text("❌ Покупка не найдена", reply_markup=self.get_main_keyboard())
                 return ConversationHandler.END
             new_amount_usdt = new_price * purchase['quantity']
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
             stats = self.db.get_dca_stats(symbol)
             new_drop_percent = calculate_current_drop(new_price, stats['avg_price']) if stats else 0
             if self.db.update_purchase(purchase_id, price=new_price, amount_usdt=new_amount_usdt, drop_percent=new_drop_percent):
@@ -5995,7 +5629,7 @@ class FastDCABot:
                     continue
                 
                 if now >= next_time:
-                    symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+                    symbol = self.db.get_setting('symbol', 'TONUSDT')
                     profit_percent = float(self.db.get_setting('profit_percent', '5'))
                     
                     logger.info(f"Scheduled purchase triggered at {now.isoformat()}")
@@ -6015,17 +5649,22 @@ class FastDCABot:
                                 msg += f"📊 Ордер на продажу: `{format_quantity(result['sell_quantity'], 5)}` {symbol.replace('USDT', '')}\n"
                             if result.get('sell_warning'):
                                 msg += f"\n⚠️ {result['sell_warning']}"
-                            await safe_send_message(self.application.bot, self.authorized_user_id, msg, parse_mode='Markdown')
+                            try:
+                                await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
+                            except:
+                                pass
                     elif result.get('error') == 'skip_price_above_avg':
                         pass
                     else:
                         if self.authorized_user_id:
-                            await safe_send_message(
-                                self.application.bot,
-                                self.authorized_user_id,
-                                f"❌ *Ошибка авто DCA*\n\n{result.get('error')}",
-                                parse_mode='Markdown'
-                            )
+                            try:
+                                await self.application.bot.send_message(
+                                    chat_id=self.authorized_user_id,
+                                    text=f"❌ *Ошибка авто DCA*\n\n{result.get('error')}",
+                                    parse_mode='Markdown'
+                                )
+                            except:
+                                pass
                     
                     frequency_hours = int(self.db.get_setting('frequency_hours', '24'))
                     next_time = next_time + timedelta(hours=frequency_hours)
@@ -6036,7 +5675,7 @@ class FastDCABot:
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                     logger.info(f"Next purchase scheduled at {next_time.isoformat()}")
                 
-                current_symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+                current_symbol = self.db.get_setting('symbol', 'TONUSDT')
                 await self.strategy.check_and_update_sell_orders(current_symbol)
                 
                 if self.authorized_user_id:
@@ -6062,7 +5701,7 @@ class FastDCABot:
                 if not self.bybit_initialized:
                     await asyncio.sleep(interval_minutes * 60)
                     continue
-                symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+                symbol = self.db.get_setting('symbol', 'TONUSDT')
                 if self.authorized_user_id:
                     result = await self.strategy.auto_check_and_notify(symbol, self.authorized_user_id, self.application.bot)
                     if result['count'] > 0:
@@ -6088,7 +5727,7 @@ class FastDCABot:
                 if not self.bybit_initialized:
                     await asyncio.sleep(3600)
                     continue
-                symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+                symbol = self.db.get_setting('symbol', 'TONUSDT')
                 if self.authorized_user_id:
                     completed_sells = await self.strategy.check_completed_sells(symbol, self.authorized_user_id, self.application.bot)
                     if completed_sells:
@@ -6111,7 +5750,7 @@ class FastDCABot:
                 if not self.bybit_initialized:
                     await asyncio.sleep(1800)
                     continue
-                symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+                symbol = self.db.get_setting('symbol', 'TONUSDT')
                 if self.authorized_user_id:
                     executed = await self.strategy.check_pending_sell_orders(symbol, self.authorized_user_id, self.application.bot)
                     if executed:
@@ -6154,7 +5793,7 @@ class FastDCABot:
                         should_notify = True
                 
                 if should_notify and self.authorized_user_id:
-                    symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+                    symbol = self.db.get_setting('symbol', 'TONUSDT')
                     current_price = await self.bybit.get_symbol_price(symbol)
                     if current_price:
                         stats = self.db.get_dca_stats(symbol)
@@ -6186,9 +5825,12 @@ class FastDCABot:
                         
                         msg += f"💡 *Сумма для ручного ордера:* `{manual_amount:.2f}` USDT"
                         
-                        await safe_send_message(self.application.bot, self.authorized_user_id, msg, parse_mode='Markdown')
-                        self.db.set_last_purchase_notify_date(current_date_str)
-                        logger.info(f"Sent daily purchase notification at {notify_time_str} MSK")
+                        try:
+                            await self.application.bot.send_message(chat_id=self.authorized_user_id, text=msg, parse_mode='Markdown')
+                            self.db.set_last_purchase_notify_date(current_date_str)
+                            logger.info(f"Sent daily purchase notification at {notify_time_str} MSK")
+                        except Exception as e:
+                            logger.error(f"Error sending purchase notification: {e}")
                 
             except asyncio.CancelledError:
                 logger.info("Purchase notify loop cancelled")
@@ -6200,7 +5842,7 @@ class FastDCABot:
             await asyncio.sleep(60)
     
     async def send_sell_recommendation_from_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
         profit_percent = float(self.db.get_setting('profit_percent', '5'))
         stats = self.db.get_dca_stats(symbol)
         if not stats:
@@ -6411,31 +6053,22 @@ class FastDCABot:
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
     
     async def post_init(self, application: Application):
-        if self._is_running:
-            logger.warning("Bot already running, skipping post_init")
-            return
-        self._is_running = True
-        
-        logger.info("Bot initialized, starting scheduler loops...")
+        logger.info("Bot initialized, scheduler loops started")
         self.scheduler_running = True
-        
-        self._init_bybit()
-        
-        if self.bybit_initialized:
-            await self.check_api_and_notify(is_startup=True)
         
         task1 = asyncio.create_task(self.dca_scheduler_loop())
         task2 = asyncio.create_task(self.order_checker_loop())
         task3 = asyncio.create_task(self.sell_checker_loop())
         task4 = asyncio.create_task(self.pending_sell_checker_loop())
         task5 = asyncio.create_task(self.purchase_notify_loop())
-        task6 = asyncio.create_task(self.api_check_loop())
         
-        self.background_tasks = [task1, task2, task3, task4, task5, task6]
+        self.background_tasks = [task1, task2, task3, task4, task5]
         
         if self.db.get_setting('dca_active', 'false') == 'true':
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
+            symbol = self.db.get_setting('symbol', 'TONUSDT')
+            self._init_bybit()
             if self.bybit_initialized and self.authorized_user_id:
+                # Проверяем наличие покупок перед созданием ордера
                 stats = self.db.get_dca_stats(symbol)
                 if stats and stats['total_quantity'] > 0:
                     await self.strategy.check_and_create_sell_order(symbol, self.application.bot, silent=False)
@@ -6449,7 +6082,6 @@ class FastDCABot:
     async def shutdown(self, application: Application):
         logger.info("Shutting down bot...")
         self.scheduler_running = False
-        self._is_running = False
         
         if self._sell_check_task and not self._sell_check_task.done():
             self._sell_check_task.cancel()
@@ -6463,37 +6095,9 @@ class FastDCABot:
         
         logger.info("Bot shutdown complete")
     
-    async def api_check_loop(self):
-        logger.info("API check loop started (every 6 hours)")
-        
-        await asyncio.sleep(60)
-        
-        while self.scheduler_running:
-            try:
-                self.refresh_api_session()
-                
-                if self.bybit_initialized:
-                    await self.check_api_and_notify(is_startup=False)
-                else:
-                    self._init_bybit()
-                    if self.bybit_initialized:
-                        await self.check_api_and_notify(is_startup=False)
-                
-                await asyncio.sleep(6 * 3600)
-                
-            except asyncio.CancelledError:
-                logger.info("API check loop cancelled")
-                break
-            except Exception as e:
-                logger.error(f"API check loop error: {e}")
-                await asyncio.sleep(300)
-    
     def setup_handlers(self):
         logger.info("Setting up handlers...")
         self.application.add_handler(CommandHandler("start", self.cmd_start_fast))
-        self.application.add_handler(CommandHandler("check_api", self.cmd_check_api))
-        self.application.add_handler(CommandHandler("account_info", self.cmd_account_info))
-        self.application.add_handler(CommandHandler("refresh_api", self.cmd_refresh_api))
         self.application.add_handler(CommandHandler("check_sells", self.cmd_check_sells))
         self.application.add_handler(CallbackQueryHandler(self.handle_order_execution_callback, pattern='^(add_order_|skip_order_|clear_stats_|skip_clear_|do_clear_|cancel_clear_|confirm_clear_stats_|skip_clear_stats_)'))
         self.application.add_handler(MessageHandler(filters.Regex('^(📤 Экспорт базы)$'), self.handle_export))
@@ -6642,10 +6246,6 @@ class FastDCABot:
         logger.info("Handlers setup completed")
     
     def run(self):
-        if self._is_running:
-            logger.warning("Bot already running, ignoring duplicate run()")
-            return
-        
         print(f"\n{Fore.CYAN}{'='*60}")
         print(f"{Fore.CYAN}🚀 ЗАПУСК DCA BYBIT BOT (МАРТИНГЕЙЛ ЛЕСТНИЦОЙ)")
         print(f"{Fore.CYAN}Версия: {BOT_VERSION}")
@@ -6660,7 +6260,6 @@ class FastDCABot:
         print(f"{Fore.WHITE}💾 База данных: dca_bot.db (данные сохраняются)")
         print(f"{Fore.WHITE}🕐 Московское время: {get_moscow_time().strftime('%H:%M')}")
         print(f"{Fore.CYAN}{'='*60}\n")
-        
         self.application.post_init = self.post_init
         self.application.shutdown = self.shutdown
         try:
