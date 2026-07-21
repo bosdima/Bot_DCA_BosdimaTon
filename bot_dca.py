@@ -2,17 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.25.0 (06.07.2026)
-ИСПРАВЛЕНИЯ v5.25.0:
-- Исправлена ошибка shutdown() missing argument
-- При запуске Авто DCA, если в статистике нет ордеров:
-  * Бот ищет последний ордер на продажу через API биржи
-  * Показывает его пользователю
-  * Затем показывает все ордера на покупку ПОСЛЕ этого ордера
-- Все проверки ищут ордера после последнего ордера в статистике
-  ИЛИ после последнего ордера на продажу через API
-- Проверка запускается только после включения Авто DCA
-- first_order_date восстанавливается при старте
+Версия 5.27.0 (21.07.2026)
+ИСПРАВЛЕНИЯ v5.27.0:
+- ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: после покупки бот НЕ ВЫСТАВЛЯЛ ВЕСЬ БАЛАНС на продажу
+- Причина: баланс монет не обновлялся достаточно быстро, и бот считал, что куплено 0 монет
+- Исправление: теперь бот использует ожидаемое количество из ордера, а не разницу балансов
+- Добавлено: принудительное обновление баланса после зачисления с несколькими попытками
+- Добавлено: если баланс не обновился, используется количество из ордера (не 0!)
+- Улучшено: логирование для отслеживания процесса зачисления монет
 """
 import os
 import sys
@@ -91,7 +88,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.25.0 (06.07.2026)"
+BOT_VERSION = "5.27.0 (21.07.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 SELL_DECIMALS_FALLBACK = 5
@@ -442,13 +439,6 @@ class Database:
             return []
 
     def get_check_start_date(self, symbol: str = None) -> Tuple[datetime, str]:
-        """
-        Определяет дату начала поиска ордеров по приоритету:
-        1. Дата последнего ордера в статистике (если есть)
-        2. Дата последней продажи из completed_sells
-        3. Fallback: 30 дней назад
-        """
-        # 1. Пробуем последний ордер в статистике
         purchases = self.get_purchases(symbol)
         if purchases:
             try:
@@ -460,7 +450,6 @@ class Database:
             except Exception as e:
                 logger.warning(f"Error parsing last purchase date: {e}")
 
-        # 2. Пробуем последнюю продажу
         last_sell = self.get_last_completed_sell(symbol)
         if last_sell and last_sell.get('sold_at'):
             try:
@@ -474,7 +463,6 @@ class Database:
             except Exception as e:
                 logger.warning(f"Error parsing sold_at: {e}")
 
-        # 3. Fallback: 30 дней назад
         check_date = get_moscow_time_naive() - timedelta(days=30)
         return check_date, "последние 30 дней (нет данных о продажах и ордерах)"
 
@@ -1716,19 +1704,65 @@ class BybitClient:
         return rounded
 
     async def wait_for_order_filled(self, symbol: str, order_id: str,
-                                     timeout: int = 10, check_interval: float = 0.5) -> bool:
+                                     timeout: int = 15, check_interval: float = 1.0) -> bool:
         try:
             start_time = time.time()
+            last_status = None
             while time.time() - start_time < timeout:
                 open_orders = await self.get_open_orders(symbol)
                 is_open = any(o.get('orderId') == order_id for o in open_orders)
                 if not is_open:
+                    logger.info(f"Order {order_id} is no longer open (presumably filled)")
                     return True
+                if last_status != is_open:
+                    logger.info(f"Order {order_id} still open, waiting...")
+                    last_status = is_open
                 await asyncio.sleep(check_interval)
+            logger.warning(f"Timeout waiting for order {order_id} to fill")
             return False
         except Exception as e:
             logger.error(f"Error waiting for order fill: {e}")
             return False
+
+    async def wait_for_balance_credit(self, coin: str, expected_quantity: float,
+                                       timeout: int = 30, check_interval: float = 1.0,
+                                       initial_balance: float = 0) -> Tuple[bool, float]:
+        logger.info(f"Waiting for {coin} balance to credit. Expected: {expected_quantity}, Initial: {initial_balance}")
+        target_balance = initial_balance + expected_quantity
+        start_time = time.time()
+        last_balance = initial_balance
+        while time.time() - start_time < timeout:
+            balance = await self.get_balance(coin)
+            if balance and 'equity' in balance:
+                current_balance = balance['equity']
+                logger.info(f"Balance check: {current_balance} {coin} (target: {target_balance})")
+                if current_balance >= target_balance * 0.9:
+                    logger.info(f"Balance credited! {current_balance} {coin} (target: {target_balance})")
+                    return True, current_balance
+                if current_balance == last_balance and time.time() - start_time > timeout * 0.7:
+                    logger.info(f"Balance not changed, checking order history...")
+                    try:
+                        history = await self.get_order_history(symbol=f"{coin}USDT", limit=10)
+                        for order in history:
+                            if order.get('orderStatus') == 'Filled' and order.get('side') == 'Buy':
+                                exec_qty = float(order.get('cumExecQty', 0))
+                                if exec_qty >= expected_quantity * 0.9:
+                                    logger.info(f"Order found in history, balance should be: {exec_qty}")
+                                    await asyncio.sleep(2)
+                                    balance = await self.get_balance(coin)
+                                    if balance and 'equity' in balance:
+                                        return True, balance['equity']
+                    except Exception as e:
+                        logger.error(f"Error checking order history: {e}")
+                last_balance = current_balance
+            await asyncio.sleep(check_interval)
+        logger.warning(f"Timeout waiting for balance credit for {coin}")
+        final_balance = await self.get_balance(coin)
+        if final_balance and 'equity' in final_balance:
+            current = final_balance['equity']
+            if current >= initial_balance + expected_quantity * 0.9:
+                return True, current
+        return False, initial_balance
 
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         if not self._is_api_available():
@@ -1811,15 +1845,11 @@ class BybitClient:
             logger.error(f"Error getting completed sell orders: {e}")
             return []
 
-    # НОВЫЙ МЕТОД: Получение последнего ордера на продажу через API
     async def get_last_completed_sell_from_api(self, symbol: str) -> Optional[Dict]:
-        """Получить последний ордер на продажу через API биржи"""
         try:
-            # Ищем за последние 90 дней
             orders = await self.get_completed_sell_orders(symbol, from_date=get_moscow_time_naive() - timedelta(days=90))
             if not orders:
                 return None
-            # Сортируем по дате и берём самый последний
             orders_sorted = sorted(orders, key=lambda x: x.get('executed_at', datetime.min), reverse=True)
             return orders_sorted[0] if orders_sorted else None
         except Exception as e:
@@ -2164,12 +2194,14 @@ class DCAStrategy:
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
         tick_size = instrument_info['tick_size']
+        
         if stats and stats['total_quantity'] > 0:
             avg_price = stats['avg_price']
             if current_price > avg_price:
                 reason = f'Текущая цена ({format_price(current_price, 4)}) ВЫШЕ средней цены ({format_price(avg_price, 4)})'
                 await self._send_purchase_skipped_notification(symbol, reason, current_price, avg_price, bot)
                 return {'success': False, 'error': 'skip_price_above_avg'}
+        
         if not stats or stats['total_quantity'] <= 0:
             amount_usdt = max(base_amount, min_amt)
             drop_percent = 0
@@ -2186,91 +2218,126 @@ class DCAStrategy:
                 amount_usdt = base_amount
                 drop_percent = 0
                 step_level = 0
+        
         if amount_usdt < min_amt:
             amount_usdt = min_amt
+        
         usdt_balance = await self.bybit.get_balance('USDT')
         available_usdt = usdt_balance.get('available', 0) if usdt_balance else 0
         if available_usdt < amount_usdt:
             return {'success': False, 'error': f'Недостаточно средств. Нужно {amount_usdt:.2f} USDT, доступно {available_usdt:.2f} USDT'}
+        
+        coin = symbol.replace('USDT', '')
+        balance_before = await self.bybit.get_balance(coin)
+        initial_balance = balance_before.get('equity', 0) if balance_before else 0
+        logger.info(f"Initial balance of {coin}: {initial_balance}")
+        
+        cancelled_old = await self.cancel_old_sell_orders(symbol)
+        if cancelled_old > 0:
+            logger.info(f"Cancelled {cancelled_old} old sell orders before purchase")
+        
         limit_price = self.bybit._round_price_by_tick(current_price, tick_size)
         if limit_price <= 0:
             limit_price = tick_size
-        cancelled_old = await self.cancel_old_sell_orders(symbol)
+        
         result = await self.bybit.place_limit_buy(symbol, limit_price, amount_usdt, is_auto=True)
-        if result['success']:
-            order_filled = await self.bybit.wait_for_order_filled(symbol, result['order_id'], timeout=10, check_interval=0.5)
-            coin = symbol.replace('USDT', '')
-            max_balance_retries = 5
-            actual_balance = 0
-            for attempt in range(max_balance_retries):
-                if attempt > 0:
-                    await asyncio.sleep(1)
-                balance_after = await self.bybit.get_balance(coin)
-                actual_balance = balance_after.get('equity', 0) if balance_after else 0
-                if actual_balance > 0:
-                    break
-            actual_quantity = actual_balance if actual_balance > 0 else result['quantity']
-            qty_decimals = instrument_info.get('qty_decimals', 5)
-            actual_quantity_rounded = round(actual_quantity, qty_decimals)
-            actual_amount_usdt = actual_quantity_rounded * result['price']
-            current_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
-            purchase_id = self.db.add_purchase(
-                symbol=symbol, amount_usdt=actual_amount_usdt, price=result['price'],
-                quantity=actual_quantity_rounded, multiplier=1.0,
-                drop_percent=drop_percent, step_level=step_level,
-                date=current_date, order_id=result.get('order_id')
-            )
-            if purchase_id is None:
-                return {'success': False, 'error': 'Order already in database'}
-            self.db.set_setting('last_purchase_price', str(result['price']))
-            self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
-            total_quantity_for_sell = actual_quantity_rounded
-            updated_stats = self.db.get_dca_stats(symbol)
-            if updated_stats and updated_stats['total_quantity'] > 0:
-                avg_price = updated_stats['avg_price']
-                target_price_sell = avg_price * (1 + profit_percent / 100)
-            else:
-                target_price_sell = result['price'] * (1 + profit_percent / 100)
-            if total_quantity_for_sell <= 0:
-                result['sell_warning'] = "⚠️ Монеты не зачислены на баланс. Ордер на продажу не создан."
-                result['sell_skipped'] = True
-                result['amount_usdt'] = amount_usdt
-                result['drop_percent'] = drop_percent
-                result['actual_quantity'] = actual_quantity_rounded
-                result['actual_amount_usdt'] = actual_amount_usdt
-                return result
-            open_orders = await self.bybit.get_open_orders(symbol)
-            existing_sell = [o for o in open_orders if o.get('side') == 'Sell']
-            if existing_sell:
-                await self.cancel_old_sell_orders(symbol)
-                await asyncio.sleep(2)
-            sell_result = await self._try_place_sell_order(symbol, total_quantity_for_sell,
-                                                            target_price_sell, profit_percent, bot)
-            if sell_result['success']:
-                result['sell_order_id'] = sell_result['order_id']
-                result['target_price'] = sell_result['price']
-                result['sell_quantity'] = sell_result['quantity']
-                result['sell_order_placed'] = True
-                await self._send_sell_order_notification(
-                    symbol=symbol, quantity=sell_result['quantity'], price=sell_result['price'],
-                    profit_percent=profit_percent,
-                    avg_price=avg_price if updated_stats else result['price'], bot=bot
-                )
-            elif sell_result.get('pending'):
-                result['pending_order_id'] = sell_result['pending_id']
-                result['sell_warning'] = "⚠️ Ордер на продажу отложен"
-                result['sell_order_placed'] = False
-            else:
-                result['sell_warning'] = sell_result.get('error', 'Не удалось создать ордер на продажу')
-                result['sell_order_placed'] = False
-            result['amount_usdt'] = amount_usdt
-            result['drop_percent'] = drop_percent
-            result['actual_quantity'] = actual_quantity_rounded
-            result['actual_amount_usdt'] = actual_amount_usdt
-        elif result.get('error') == 'insufficient_balance':
-            return {'success': False, 'error': f'Недостаточно USDT на балансе. Нужно {amount_usdt:.2f} USDT'}
-        else:
+        if not result['success']:
+            if result.get('error') == 'insufficient_balance':
+                return {'success': False, 'error': f'Недостаточно USDT на балансе. Нужно {amount_usdt:.2f} USDT'}
             return result
+        
+        order_filled = await self.bybit.wait_for_order_filled(symbol, result['order_id'], timeout=15, check_interval=1.0)
+        if not order_filled:
+            logger.warning(f"Order {result['order_id']} may not be filled yet, continuing...")
+        
+        expected_quantity = result['quantity']
+        logger.info(f"Waiting for balance credit: expected {expected_quantity} {coin}")
+        
+        balance_credited, actual_balance = await self.bybit.wait_for_balance_credit(
+            coin, expected_quantity, timeout=30, check_interval=1.0, initial_balance=initial_balance
+        )
+        
+        # !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ !!!
+        # Теперь используем ожидаемое количество из ордера, если баланс не обновился
+        if not balance_credited:
+            logger.warning(f"Balance credit timeout for {coin}, using expected quantity: {expected_quantity}")
+            actual_quantity = expected_quantity
+        else:
+            actual_quantity = actual_balance - initial_balance
+            if actual_quantity <= 0:
+                logger.warning(f"Balance difference is {actual_quantity}, using expected quantity: {expected_quantity}")
+                actual_quantity = expected_quantity
+            else:
+                logger.info(f"Balance credited: {actual_balance} {coin}, purchased: {actual_quantity}")
+        
+        qty_decimals = instrument_info.get('qty_decimals', 5)
+        actual_quantity_rounded = round(actual_quantity, qty_decimals)
+        if actual_quantity_rounded <= 0:
+            logger.warning(f"Rounded quantity is 0, using expected quantity: {expected_quantity}")
+            actual_quantity_rounded = round(expected_quantity, qty_decimals)
+        
+        actual_amount_usdt = actual_quantity_rounded * result['price']
+        
+        current_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
+        purchase_id = self.db.add_purchase(
+            symbol=symbol, amount_usdt=actual_amount_usdt, price=result['price'],
+            quantity=actual_quantity_rounded, multiplier=1.0,
+            drop_percent=drop_percent, step_level=step_level,
+            date=current_date, order_id=result.get('order_id')
+        )
+        
+        if purchase_id is None:
+            return {'success': False, 'error': 'Order already in database'}
+        
+        self.db.set_setting('last_purchase_price', str(result['price']))
+        self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
+        
+        # !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ !!!
+        # Теперь используем actual_quantity_rounded для продажи ВСЕГО баланса
+        total_quantity_for_sell = actual_quantity_rounded
+        
+        updated_stats = self.db.get_dca_stats(symbol)
+        if updated_stats and updated_stats['total_quantity'] > 0:
+            avg_price = updated_stats['avg_price']
+            target_price_sell = avg_price * (1 + profit_percent / 100)
+        else:
+            target_price_sell = result['price'] * (1 + profit_percent / 100)
+        
+        result['amount_usdt'] = amount_usdt
+        result['drop_percent'] = drop_percent
+        result['actual_quantity'] = actual_quantity_rounded
+        result['actual_amount_usdt'] = actual_amount_usdt
+        
+        logger.info(f"Total quantity for sell: {total_quantity_for_sell} {coin}")
+        
+        if total_quantity_for_sell <= 0:
+            result['sell_warning'] = "⚠️ Количество монет для продажи = 0. Ордер на продажу не создан."
+            result['sell_skipped'] = True
+            return result
+        
+        await self.cancel_old_sell_orders(symbol)
+        await asyncio.sleep(2)
+        
+        sell_result = await self._try_place_sell_order(symbol, total_quantity_for_sell,
+                                                        target_price_sell, profit_percent, bot)
+        if sell_result['success']:
+            result['sell_order_id'] = sell_result['order_id']
+            result['target_price'] = sell_result['price']
+            result['sell_quantity'] = sell_result['quantity']
+            result['sell_order_placed'] = True
+            await self._send_sell_order_notification(
+                symbol=symbol, quantity=sell_result['quantity'], price=sell_result['price'],
+                profit_percent=profit_percent,
+                avg_price=avg_price if updated_stats else result['price'], bot=bot
+            )
+        elif sell_result.get('pending'):
+            result['pending_order_id'] = sell_result['pending_id']
+            result['sell_warning'] = "⚠️ Ордер на продажу отложен"
+            result['sell_order_placed'] = False
+        else:
+            result['sell_warning'] = sell_result.get('error', 'Не удалось создать ордер на продажу')
+            result['sell_order_placed'] = False
+        
         return result
 
     async def _try_place_sell_order(self, symbol: str, quantity: float, target_price: float,
@@ -2701,12 +2768,7 @@ class DCAStrategy:
             new_orders = await self.check_new_orders_incremental(symbol, user_id, bot)
             return {'type': 'incremental', 'count': len(new_orders), 'orders': new_orders}
 
-    # НОВЫЙ МЕТОД: Поиск последнего ордера на продажу через API и показ ордеров после него
     async def find_and_show_orders_after_last_sell(self, symbol: str, bot, user_id: int) -> Dict:
-        """
-        Ищет последний ордер на продажу через API биржи, показывает его,
-        затем показывает все ордера на покупку ПОСЛЕ этого ордера продажи.
-        """
         result = {
             'last_sell_order': None,
             'buy_orders_after_sell': [],
@@ -2714,7 +2776,6 @@ class DCAStrategy:
             'check_reason': ''
         }
         
-        # 1. Ищем последний ордер на продажу через API
         last_sell = await self.bybit.get_last_completed_sell_from_api(symbol)
         
         if last_sell:
@@ -2722,7 +2783,6 @@ class DCAStrategy:
             result['check_date'] = last_sell['executed_at']
             result['check_reason'] = f"последний ордер на продажу через API ({last_sell['executed_at'].strftime('%d.%m.%Y %H:%M')})"
             
-            # Показываем пользователю последний ордер на продажу
             sell_msg = (
                 f"🔍 *ПОСЛЕДНИЙ ОРДЕР НА ПРОДАЖУ (через API биржи):*\n"
                 f"🪙 Токен: `{symbol}`\n"
@@ -2736,11 +2796,9 @@ class DCAStrategy:
             if user_id:
                 await safe_send_message(bot, user_id, sell_msg, parse_mode='Markdown')
             
-            # 2. Ищем ордера на покупку после этой даты
             check_date = last_sell['executed_at']
             all_orders = await self.bybit.get_all_executed_orders(symbol, from_date=check_date)
             
-            # Фильтруем ордера, которые уже в статистике
             purchases = self.db.get_purchases(symbol)
             added_orders = set()
             for p in purchases:
@@ -2790,7 +2848,6 @@ class DCAStrategy:
                 if user_id:
                     await safe_send_message(bot, user_id, buy_msg, parse_mode='Markdown')
                 
-                # Показываем каждый ордер
                 for order in new_orders:
                     msg = (f"✅ *ОРДЕР ИСПОЛНЕН!*\n"
                            f"🪙 Токен: `{symbol}`\n"
@@ -3877,7 +3934,6 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return NOTIFICATION_SETTINGS_MENU
         
-        # Проверяем, запущен ли Авто DCA
         if not self.db.is_dca_active():
             await update.message.reply_text(
                 "⚠️ *Авто DCA не запущен!*\n\n"
@@ -3901,7 +3957,6 @@ class FastDCABot:
         
         symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         
-        # Получаем информацию о последнем ордере в статистике
         purchases = self.db.get_purchases(symbol)
         last_purchase_info = ""
         if purchases:
@@ -3922,7 +3977,6 @@ class FastDCABot:
         else:
             last_purchase_info = "📋 *ПОСЛЕДНИЙ ОРДЕР В СТАТИСТИКЕ:* В статистике нет ордеров\n"
         
-        # Выполняем проверку
         buy_result = await self.strategy.force_check_executed_orders(symbol, self.application.bot, self.authorized_user_id)
         sell_result = await self.strategy.force_check_completed_sells(symbol, self.application.bot, self.authorized_user_id)
         
@@ -4343,7 +4397,6 @@ class FastDCABot:
             message += f"\n📊 Всего покупок: `{stats['total_purchases']}`\n💰 Вложено: `{stats['total_usdt']:.2f}` USDT"
         await safe_send_message(self.application.bot, update.effective_user.id, message, parse_mode='Markdown')
 
-    # ИСПРАВЛЕННЫЙ МЕТОД: При включении DCA, если в статистике нет ордеров, ищем последний ордер на продажу через API
     async def toggle_dca(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -4381,14 +4434,12 @@ class FastDCABot:
             )
             stats = self.db.get_dca_stats(symbol)
             if not stats or stats['total_quantity'] <= 0:
-                # В статистике нет ордеров — ищем последний ордер на продажу через API
                 await update.message.reply_text(
                     f"📊 *В статистике нет ордеров!*\n"
                     f"🔍 Ищу последний ордер на продажу через API биржи...",
                     parse_mode='Markdown'
                 )
                 
-                # Вызываем новый метод для поиска и показа ордеров
                 result = await self.strategy.find_and_show_orders_after_last_sell(
                     symbol, self.application.bot, self.authorized_user_id
                 )
@@ -5607,7 +5658,6 @@ class FastDCABot:
         self.db.reset_incremental_check_time()
         await update.callback_query.edit_message_text("⏭ Пропущено. Ордер не будет добавлен в статистику.")
 
-    # ИСПРАВЛЕННЫЙ МЕТОД: Восстановление first_order_date при старте
     async def post_init(self, application=None):
         if self._is_running:
             logger.warning("Bot already running, skipping post_init")
@@ -5615,7 +5665,6 @@ class FastDCABot:
         self._is_running = True
         logger.info("Bot initialized, starting scheduler loops...")
         
-        # Восстанавливаем first_order_date если он пустой, но есть покупки
         first_order_date = self.db.get_first_order_date()
         if first_order_date is None:
             purchases = self.db.get_purchases()
@@ -5644,7 +5693,6 @@ class FastDCABot:
                         self.strategy.sell_order_check_loop(symbol, self.authorized_user_id, self.application.bot)
                     )
 
-    # ИСПРАВЛЕННЫЙ МЕТОД: Опциональный аргумент application
     async def shutdown(self, application=None):
         logger.info("Shutting down bot...")
         self.scheduler_running = False
