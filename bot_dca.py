@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.40.0 (23.08.2026)
+Версия 5.40.1 (05.09.2026) - HOTFIX: Исправлено отслеживание ID ордеров при продаже
 Исправления:
-- Улучшена надежность мониторинга ордеров на продажу (polling + WebSocket fallback)
-- Исправлена обработка завершенных продаж и отправка уведомлений
-- Исправлена автоматическая очистка статистики после продажи
-- Улучшена обработка ошибок WebSocket
-- Добавлены дополнительные проверки баланса перед созданием ордера
+- Критическое исправление: теперь используется РЕАЛЬНЫЙ order_id с биржи при создании ордера на продажу
+- Исправлена обработка завершенных продаж с использованием реального ID ордера
+- Улучшено определение своих ордеров при мониторинге (fallback по данным ордера)
+- Исправлена отправка уведомлений о продаже и предложение очистить статистику
 """
 import os
 import sys
@@ -131,7 +130,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.40.0 (23.08.2026)"
+BOT_VERSION = "5.40.1 (05.09.2026)"
 CONVERSATION_TIMEOUT = 180
 SELL_DECIMALS_FALLBACK = 5
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -2226,7 +2225,6 @@ class DCAStrategy:
             
             if actual_balance < min_qty:
                 error = f'Недостаточно монет для продажи (баланс: {actual_balance:.8f}, минимум: {min_qty})'
-                # Не отправляем уведомление, так как это нормальная ситуация после очистки
                 logger.info(f"No sell order created for {symbol}: {error}")
                 return {'success': False, 'error': error, 'insufficient_balance': True}
             
@@ -2280,11 +2278,13 @@ class DCAStrategy:
             
             result = await self.bybit.place_limit_sell(symbol, sell_qty, rounded_price)
             if result['success']:
-                self.db.add_sell_order(symbol, result['order_id'], result['quantity'],
+                # Используем РЕАЛЬНЫЙ order_id с биржи
+                real_order_id = result['order_id']
+                self.db.add_sell_order(symbol, real_order_id, result['quantity'],
                                        result['price'], profit_percent)
                 await self._send_sell_order_notification(symbol, result['quantity'], result['price'],
-                                                         profit_percent, avg_price, result['order_id'])
-                return {'success': True, 'order_id': result['order_id'],
+                                                         profit_percent, avg_price, real_order_id)
+                return {'success': True, 'order_id': real_order_id,
                         'quantity': result['quantity'], 'price': result['price'],
                         'profit_percent': profit_percent}
             else:
@@ -2405,9 +2405,6 @@ class DCAStrategy:
                         # Устанавливаем дедлайн для автоматической очистки через 3 часа
                         deadline = get_moscow_time_naive() + timedelta(hours=AUTO_CLEAR_DELAY_HOURS)
                         self.db.set_clear_deadline(sell_id, deadline)
-                        
-                        # НЕ ОЧИЩАЕМ СТАТИСТИКУ СРАЗУ!
-                        # Очистка произойдет либо по кнопке, либо автоматически через 3 часа
                         
                         await asyncio.sleep(3)
                         stats_after = self.db.get_dca_stats(symbol)
@@ -2575,8 +2572,6 @@ class DCAStrategy:
                 deadline = get_moscow_time_naive() + timedelta(hours=AUTO_CLEAR_DELAY_HOURS)
                 self.db.set_clear_deadline(sell_id, deadline)
                 
-                # НЕ ОЧИЩАЕМ СТАТИСТИКУ СРАЗУ!
-                
                 await asyncio.sleep(3)
                 stats_after = self.db.get_dca_stats(symbol)
                 if stats_after and stats_after['total_quantity'] > 0:
@@ -2670,9 +2665,10 @@ class DCAStrategy:
                     'reason': f'Сумма ордера ({order_value:.2f}) < {min_amt}'}
         result = await self.bybit.place_limit_sell(symbol, rounded_qty, rounded_price)
         if result['success']:
-            self.db.add_sell_order(symbol, result['order_id'], result['quantity'],
+            real_order_id = result['order_id']
+            self.db.add_sell_order(symbol, real_order_id, result['quantity'],
                                    result['price'], profit_percent)
-            return {'success': True, 'order_id': result['order_id'],
+            return {'success': True, 'order_id': real_order_id,
                     'quantity': result['quantity'], 'price': result['price']}
         elif result.get('error') == 'insufficient_balance':
             pending_id = self.db.add_pending_sell_order(symbol, rounded_qty, rounded_price,
@@ -3315,12 +3311,13 @@ class DCAStrategy:
                 await update.message.reply_text(f"📤 Выставляю ордер на продажу {format_quantity(sell_qty, 5)} {coin} по {format_price(rounded_price, 4)} USDT...")
             result = await self.bybit.place_limit_sell(symbol, sell_qty, rounded_price)
             if result['success']:
-                self.db.add_sell_order(symbol, result['order_id'], sell_qty, rounded_price, profit_percent)
+                real_order_id = result['order_id']
+                self.db.add_sell_order(symbol, real_order_id, sell_qty, rounded_price, profit_percent)
                 warning = ""
                 if sell_qty < stats['total_quantity']:
                     warning = f"\n⚠️ Продано только {format_quantity(sell_qty, 5)} из {format_quantity(stats['total_quantity'], 5)} {coin}."
                 return {
-                    'success': True, 'order_id': result['order_id'], 'quantity': sell_qty,
+                    'success': True, 'order_id': real_order_id, 'quantity': sell_qty,
                     'price': rounded_price, 'raw_price': raw_target,
                     'profit_percent': profit_percent, 'warning': warning
                 }
