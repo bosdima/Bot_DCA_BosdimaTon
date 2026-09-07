@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.42.0 (07.09.2026)
 Исправления:
 - Улучшена надежность мониторинга ордеров на продажу (polling + WebSocket fallback)
 - Исправлена обработка завершенных продаж и отправка уведомлений
@@ -10,6 +9,9 @@ DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 - Улучшена обработка ошибок WebSocket
 - Добавлены дополнительные проверки баланса перед созданием ордера
 """
+
+BOT_VERSION = "5.42.0 (07.09.2026)"
+
 import os
 import sys
 import asyncio
@@ -136,7 +138,6 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.40.0 (23.08.2026)"
 CONVERSATION_TIMEOUT = 180
 SELL_DECIMALS_FALLBACK = 5
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
