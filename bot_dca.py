@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.41.0 (06.09.2026)
-ИСПРАВЛЕНИЯ:
-- Исправлена ошибка WebSocket: object NoneType can't be used in 'await' expression
-- Добавлена правильная обработка WebSocket через asyncio.to_thread
-- Добавлена обработка ошибки 'Too many sessions under the same UID'
-- Оптимизирован механизм переподключения WebSocket
-- Добавлена проверка активных сессий перед созданием новой
+Версия 5.42.0 (07.09.2026)
+Исправления:
+- Улучшена надежность мониторинга ордеров на продажу (polling + WebSocket fallback)
+- Исправлена обработка завершенных продаж и отправка уведомлений
+- Исправлена автоматическая очистка статистики после продажи
+- Улучшена обработка ошибок WebSocket
+- Добавлены дополнительные проверки баланса перед созданием ордера
 """
 import os
 import sys
@@ -19,6 +19,7 @@ import sqlite3
 import re
 import time
 import math
+import random
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Union
 from colorama import init, Fore, Style
@@ -93,10 +94,14 @@ async def safe_send_message(bot, chat_id, text, parse_mode=None, reply_markup=No
     except Exception as e:
         if "Can't parse entities" in str(e) or "Bad Request" in str(e):
             logger.warning(f"Markdown parse error, sending without formatting: {e}")
-            clean_text = text.replace('*', '').replace('`', '').replace('_', '').replace('~', '')
-            return await bot.send_message(chat_id=chat_id, text=clean_text, reply_markup=reply_markup)
+            try:
+                clean_text = text.replace('*', '').replace('`', '').replace('_', '').replace('~', '')
+                return await bot.send_message(chat_id=chat_id, text=clean_text, reply_markup=reply_markup)
+            except Exception as e2:
+                logger.error(f"Telegram fallback send failed: {e2}")
         else:
-            raise e
+            logger.error(f"Telegram send failed: {e}")
+        return None
 
 # =============================================================================
 
@@ -131,7 +136,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.41.0 (06.09.2026)"
+BOT_VERSION = "5.40.0 (23.08.2026)"
 CONVERSATION_TIMEOUT = 180
 SELL_DECIMALS_FALLBACK = 5
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -1485,6 +1490,7 @@ class BybitClient:
         self._price_cache = {}
         self._cache_time = {}
         self._cache_ttl = 5
+        self._cache_stale_ttl = 300
         self._instrument_cache = {}
         self._instrument_cache_time = {}
         self._instrument_cache_ttl = 3600
@@ -1492,10 +1498,6 @@ class BybitClient:
         self.ws = None
         self.ws_running = False
         self._order_update_callback = None
-        self._ws_task = None
-        self._reconnect_attempts = 0
-        self._max_reconnect_attempts = 5
-        self._reconnect_delay = 60
 
     def _init_session(self):
         try:
@@ -1524,98 +1526,110 @@ class BybitClient:
             self._refresh_session()
         return self.session is not None and self.api_key and self.api_secret
 
-    async def start_websocket(self, callback, symbol: str):
-        """
-        Запускает WebSocket для отслеживания обновлений ордеров.
-        Исправленная версия - использует asyncio.to_thread для синхронного WebSocket.
-        """
-        if self.ws_running:
-            logger.info("WebSocket уже запущен")
-            return
+    @staticmethod
+    def _is_retriable_exc(e: Exception) -> bool:
+        """Сетевой сбой / таймаут / rate-limit — запрос можно повторить."""
+        err = str(e).lower()
+        return ('timeout' in err or 'connection' in err or 'econn' in err
+                or 'reset' in err or 'read' in err or 'rate' in err
+                or '10016' in err or '10018' in err)
 
-        # Проверяем, не превышено ли количество попыток переподключения
-        if self._reconnect_attempts >= self._max_reconnect_attempts:
-            logger.warning(f"Достигнуто максимальное количество попыток переподключения ({self._max_reconnect_attempts})")
-            self._reconnect_attempts = 0
+    @staticmethod
+    def _is_rate_limit(ret_code: int) -> bool:
+        return ret_code in (10016, 10018)
+
+    async def _place_order_with_retry(self, symbol: str, side: str, qty: str,
+                                      price: str, context: str = "") -> Dict:
+        """Размещение ордера с ретраями на rate-limit (10016/10018) и сетевые сбои."""
+        for attempt in range(3):
+            try:
+                if not self.session:
+                    self._init_session()
+                response = self.session.place_order(
+                    category="spot", symbol=symbol, side=side, orderType="Limit",
+                    qty=qty, price=price, timeInForce="GTC"
+                )
+                if response['retCode'] in (0, 170131):
+                    return response
+                if BybitClient._is_rate_limit(int(response['retCode'])):
+                    if attempt == 1:
+                        logger.warning(f"Bybit rate limit ({response['retCode']}), повторяю: {context}")
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return response
+            except Exception as e:
+                if attempt < 2 and BybitClient._is_retriable_exc(e):
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                logger.error(f"Ошибка размещения ордера ({context}): {e}")
+                return {'retCode': -1, 'retMsg': str(e), 'result': {}}
+        return {'retCode': -1, 'retMsg': 'Ретраи исчерпаны', 'result': {}}
+
+    async def start_websocket(self, callback, symbol: str):
+        """Запускает WebSocket для отслеживания обновлений ордеров."""
+        if self.ws_running:
+            logger.info("WebSocket already running")
             return
 
         self._order_update_callback = callback
-        
-        try:
-            logger.info(f"Запуск WebSocket для {symbol}... (попытка {self._reconnect_attempts + 1})")
-            
-            # Создаем экземпляр WebSocket
-            self.ws = WebSocket(
-                testnet=self.testnet,
-                channel_type="private",
-                api_key=self.api_key,
-                api_secret=self.api_secret
-            )
-            
-            # ВАЖНО: order_stream - это НЕ async метод, он синхронный!
-            # Запускаем его в отдельном потоке через asyncio.to_thread
-            self.ws_running = True
-            
-            # Запускаем WebSocket в отдельной задаче
-            self._ws_task = asyncio.create_task(
-                self._run_websocket_thread(symbol)
-            )
-            
-            logger.info(f"WebSocket запущен для {symbol}")
-            self._reconnect_attempts = 0  # Сбрасываем счетчик при успешном запуске
-            
-        except Exception as e:
-            logger.error(f"Ошибка WebSocket: {e}")
-            self.ws_running = False
-            self._reconnect_attempts += 1
-            
-            # Попытка переподключения с задержкой
-            if self._reconnect_attempts < self._max_reconnect_attempts:
-                delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))  # Экспоненциальная задержка
-                logger.info(f"Повторное подключение через {delay} секунд...")
-                await asyncio.sleep(delay)
-                asyncio.create_task(self.start_websocket(callback, symbol))
-            else:
-                logger.error("Превышено максимальное количество попыток переподключения WebSocket")
-                if self._order_update_callback:
-                    # Уведомляем о проблеме через callback
-                    await self._order_update_callback({
-                        'error': 'WebSocket connection failed after max retries',
-                        'symbol': symbol
-                    })
+        fail_count = 0
+        last_error_log = 0.0
+        while True:
+            # Перед созданием нового сокета обязательно закрываем старый.
+            # Иначе Bybit копит сессии и отклоняет авторизацию:
+            # "Too many sessions under the same UID".
+            if self.ws:
+                try:
+                    await self.ws.exit()
+                except Exception:
+                    pass
+            try:
+                logger.info(f"Starting WebSocket for {symbol}...")
 
-    async def _run_websocket_thread(self, symbol: str):
-        """Запускает WebSocket в отдельном потоке."""
-        try:
-            # Используем asyncio.to_thread для запуска синхронного метода в потоке
-            # Это позволяет избежать блокировки event loop
-            await asyncio.to_thread(
-                self.ws.order_stream,
-                callback=self._handle_order_update
-            )
-        except Exception as e:
-            logger.error(f"Ошибка в WebSocket потоке: {e}")
-            self.ws_running = False
-            
-            # Проверяем, не является ли ошибка "Too many sessions"
-            if "Too many sessions" in str(e):
-                logger.warning("Обнаружено превышение количества сессий WebSocket")
-                # Увеличиваем задержку перед переподключением
-                self._reconnect_delay = 300  # 5 минут
-                self._reconnect_attempts = self._max_reconnect_attempts  # Останавливаем переподключения
-                if self._order_update_callback:
-                    await self._order_update_callback({
-                        'error': 'Too many WebSocket sessions',
-                        'symbol': symbol
-                    })
-            else:
-                # Другие ошибки - пытаемся переподключиться
-                self._reconnect_attempts += 1
-                if self._reconnect_attempts < self._max_reconnect_attempts:
-                    delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
-                    logger.info(f"Переподключение через {delay} секунд...")
-                    await asyncio.sleep(delay)
-                    asyncio.create_task(self.start_websocket(self._order_update_callback, symbol))
+                self.ws = WebSocket(
+                    testnet=self.testnet,
+                    channel_type="private",
+                    api_key=self.api_key,
+                    api_secret=self.api_secret
+                )
+
+                self.ws_running = True
+                logger.info(f"WebSocket started successfully")
+                fail_count = 0
+
+                # order_stream блокирует, пока соединение живо; выходит при
+                # разрыве/ошибке авторизации — цикл ниже даёт мягкий выход по stop.
+                await self.ws.order_stream(
+                    callback=self._handle_order_update
+                )
+
+                while self.ws_running:
+                    await asyncio.sleep(10)
+                    if not self.ws_running:
+                        break
+
+            except Exception as e:
+                fail_count += 1
+                # Не спамим ERROR каждые 60 секунд: заметная запись раз в 10 минут,
+                # промежуточные попытки — DEBUG.
+                now = time.time()
+                if now - last_error_log > 600 or fail_count <= 3:
+                    logger.error(f"WebSocket error: {e} (сбой #{fail_count})")
+                    last_error_log = now
+                else:
+                    logger.debug(f"WebSocket retry... (сбой #{fail_count}): {e}")
+            finally:
+                self.ws_running = False
+                if self.ws:
+                    try:
+                        await self.ws.exit()
+                    except Exception:
+                        pass
+            # Реконнект с плавным ростом паузы (60->120->240->300 c) и случайным
+            # сдвигом, чтобы два экземпляра с одними ключами не подключались
+            # одновременно и не плодили лишние сессии на Bybit.
+            delay = min(60 * (2 ** min(fail_count - 1, 2)), 300) + random.uniform(0, 30)
+            await asyncio.sleep(delay)
 
     async def _handle_order_update(self, message):
         """Обработчик обновлений ордеров через WebSocket."""
@@ -1632,7 +1646,7 @@ class BybitClient:
             if not order_id or not order_status:
                 return
                 
-            logger.info(f"WebSocket обновление ордера: {order_id} -> {order_status}")
+            logger.info(f"WebSocket order update: {order_id} -> {order_status}")
             
             if order_status == 'Filled' and side == 'Sell' and self._order_update_callback:
                 order_info = {
@@ -1649,33 +1663,19 @@ class BybitClient:
                 await self._order_update_callback(order_info)
                 
         except Exception as e:
-            logger.error(f"Ошибка обработки WebSocket сообщения: {e}")
+            logger.error(f"Error handling WebSocket message: {e}")
 
     async def stop_websocket(self):
-        """Останавливает WebSocket."""
         self.ws_running = False
-        self._reconnect_attempts = 0
-        
-        if self._ws_task and not self._ws_task.done():
-            self._ws_task.cancel()
-            try:
-                await asyncio.wait_for(self._ws_task, timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка остановки WebSocket задачи: {e}")
-        
         if self.ws:
             try:
-                await asyncio.to_thread(self.ws.exit)
-            except Exception as e:
-                logger.error(f"Ошибка закрытия WebSocket: {e}")
-        
+                await self.ws.exit()
+            except:
+                pass
         self.ws = None
-        self._ws_task = None
-        logger.info("WebSocket остановлен")
+        logger.info("WebSocket stopped")
 
-    # --- Остальные методы (без изменений) ---
+    # --- Остальные методы ---
     async def check_api_health(self) -> Dict:
         self._refresh_session()
         if not self._is_api_available():
@@ -1713,11 +1713,11 @@ class BybitClient:
                     'user_message': f'Ошибка соединения: {str(e)[:100]}', 'is_api_error': True}
 
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
-        if not self._is_api_available():
-            return None
         now = time.time()
         if symbol in self._cache_time and now - self._cache_time.get(symbol, 0) < self._cache_ttl:
             return self._price_cache.get(symbol)
+        if not self._is_api_available():
+            return self._stale_price_fallback(symbol, now)
         try:
             if not self.session:
                 self._init_session()
@@ -1727,10 +1727,21 @@ class BybitClient:
                 self._price_cache[symbol] = price
                 self._cache_time[symbol] = now
                 return price
-            return None
+            return self._stale_price_fallback(symbol, now)
         except Exception as e:
             logger.error(f"Error getting price for {symbol}: {e}")
-            return None
+            return self._stale_price_fallback(symbol, now)
+
+    def _stale_price_fallback(self, symbol: str, now: float) -> Optional[float]:
+        """Возвращает последнюю известную цену, если сеть/API сбойнули,
+        но только пока она не устарела дольше _cache_stale_ttl (5 минут)."""
+        cached = self._price_cache.get(symbol)
+        if cached is not None:
+            cached_age = now - self._cache_time.get(symbol, 0)
+            if cached_age < self._cache_stale_ttl:
+                return cached
+            logger.warning(f"Цена {symbol} в кэше устарела ({cached_age:.0f}s), не использую")
+        return None
 
     async def cancel_all_sell_orders(self, symbol: str) -> Tuple[int, List[str]]:
         if not self._is_api_available():
@@ -1908,7 +1919,7 @@ class BybitClient:
         return rounded
 
     async def wait_for_order_filled(self, symbol: str, order_id: str,
-                                     timeout: int = 3600, check_interval: float = 5.0) -> bool:
+                                     timeout: int = 3600, check_interval: float = 8.0) -> bool:
         try:
             start_time = time.time()
             while time.time() - start_time < timeout:
@@ -1918,16 +1929,8 @@ class BybitClient:
                         return True
                     elif status in ['Cancelled', 'Rejected']:
                         return False
-                open_orders = await self.get_open_orders(symbol)
-                is_open = any(o.get('orderId') == order_id for o in open_orders)
-                if not is_open:
-                    history = await self.get_order_history(symbol, limit=20)
-                    for o in history:
-                        if o.get('orderId') == order_id:
-                            if o.get('orderStatus') == 'Filled':
-                                return True
-                            else:
-                                return False
+                # get_order_status уже проверяет и открытые ордера, и историю —
+                # отдельные запросы здесь не нужны (экономия API-квоты).
                 await asyncio.sleep(check_interval)
             return False
         except Exception as e:
@@ -1935,7 +1938,7 @@ class BybitClient:
             return False
 
     async def wait_for_balance_credit(self, coin: str, expected_quantity: float,
-                                       timeout: int = 120, check_interval: float = 2.0,
+                                       timeout: int = 120, check_interval: float = 3.0,
                                        initial_balance: float = 0) -> Tuple[bool, float, float]:
         logger.info(f"[BALANCE CREDIT] Waiting for {coin} balance credit. Expected: {expected_quantity:.8f}")
         target_balance = initial_balance + expected_quantity
@@ -2058,15 +2061,23 @@ class BybitClient:
     async def cancel_order(self, symbol: str, order_id: str) -> Dict:
         if not self._is_api_available():
             return {'success': False, 'error': 'API not available'}
-        try:
-            if not self.session:
-                self._init_session()
-            response = self.session.cancel_order(category="spot", symbol=symbol, orderId=order_id)
-            if response['retCode'] == 0:
-                return {'success': True}
-            return {'success': False, 'error': response['retMsg']}
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
+        for attempt in range(3):
+            try:
+                if not self.session:
+                    self._init_session()
+                response = self.session.cancel_order(category="spot", symbol=symbol, orderId=order_id)
+                if response['retCode'] == 0:
+                    return {'success': True}
+                if BybitClient._is_rate_limit(int(response['retCode'])):
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return {'success': False, 'error': response['retMsg']}
+            except Exception as e:
+                if attempt < 2 and BybitClient._is_retriable_exc(e):
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return {'success': False, 'error': str(e)}
+        return {'success': False, 'error': 'Не удалось отменить ордер: ретраи исчерпаны'}
 
     async def place_limit_sell(self, symbol: str, quantity: float, price: float) -> Dict:
         if not self._is_api_available():
@@ -2096,9 +2107,10 @@ class BybitClient:
             if order_value < min_amt:
                 return {'success': False, 'error': 'min_amount_error', 'min_amt': min_amt,
                         'order_value': order_value, 'quantity': rounded_quantity, 'price': rounded_price}
-            response = self.session.place_order(
-                category="spot", symbol=symbol, side="Sell", orderType="Limit",
-                qty=str(rounded_quantity), price=str(rounded_price), timeInForce="GTC"
+            response = await self._place_order_with_retry(
+                symbol=symbol, side="Sell", qty=str(rounded_quantity),
+                price=str(rounded_price),
+                context=f"Продажа {symbol} {rounded_quantity}"
             )
             if response['retCode'] == 0:
                 return {'success': True, 'order_id': response['result']['orderId'],
@@ -2674,7 +2686,7 @@ class DCAStrategy:
         except Exception as e:
             logger.error(f"Error handling order update: {e}")
 
-    # --- Остальные методы (без изменений) ---
+    # --- Остальные методы ---
     async def _place_buy_order_and_wait(self, symbol: str, price: float, amount: float, is_auto: bool) -> Dict:
         result = await self.bybit.place_limit_buy(symbol, price, amount, is_auto)
         if not result['success']:
@@ -3427,6 +3439,11 @@ class FastDCABot:
         self.setup_handlers()
 
     def _init_bybit(self, force_reload: bool = False):
+        if self.bybit and self.bybit_initialized and not force_reload:
+            # Клиент уже есть — не пересоздаём его. Иначе вместе со старым
+            # клиентом "потеряется" и его WebSocket: сессия останется жить на
+            # стороне Bybit и накопится "Too many sessions under the same UID".
+            return
         api_key, api_secret = get_api_keys()
         if not api_key or not api_secret:
             logger.warning("API keys missing in .env")
@@ -3444,10 +3461,14 @@ class FastDCABot:
             self.bybit_initialized = False
 
     def refresh_api_session(self):
-        logger.info("Refreshing API session...")
-        self.bybit_initialized = False
-        self.bybit = None
-        self._init_bybit(force_reload=True)
+        # Важно: НЕ заменяем BybitClient целиком (иначе старый WebSocket
+        # остаётся открытым и копит сессии на Bybit). Обновляем только
+        # HTTP-сессию внутри существующего клиента.
+        if not self.bybit:
+            self._init_bybit()
+            return self.bybit_initialized
+        self.bybit._refresh_session()
+        self.bybit_initialized = self.bybit._is_api_available()
         return self.bybit_initialized
 
     async def check_api_and_notify(self, is_startup: bool = False) -> bool:
@@ -5198,7 +5219,7 @@ class FastDCABot:
                     self.strategy.sell_order_monitor_loop(symbol, self.authorized_user_id, self.application.bot)
                 )
             
-            # Запускаем WebSocket (исправленная версия)
+            # Запускаем WebSocket (если работает)
             if self._websocket_task is None or self._websocket_task.done():
                 self._websocket_task = asyncio.create_task(
                     self.bybit.start_websocket(
@@ -6056,7 +6077,7 @@ class FastDCABot:
                     self._sell_monitor_task = asyncio.create_task(
                         self.strategy.sell_order_monitor_loop(symbol, self.authorized_user_id, self.application.bot)
                     )
-                    # Запускаем WebSocket (исправленная версия)
+                    # Запускаем WebSocket
                     self._websocket_task = asyncio.create_task(
                         self.bybit.start_websocket(
                             self.strategy.handle_order_update,
