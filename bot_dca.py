@@ -2,16 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Исправления:
-- ИСПРАВЛЕН WebSocket: order_stream теперь запускается в отдельном потоке через asyncio.to_thread
-- Улучшена надежность мониторинга ордеров на продажу (polling + WebSocket fallback)
-- Исправлена обработка завершенных продаж и отправка уведомлений
-- Исправлена автоматическая очистка статистики после продажи
-- Улучшена обработка ошибок WebSocket
-- Добавлены дополнительные проверки баланса перед созданием ордера
+Исправления v5.44.0:
+- ИСПРАВЛЕНА АВТООЧИСТКА СТАТИСТИКИ: добавлен отдельный цикл auto_clear_loop()
+- ИСПРАВЛЕН WebSocket: main event loop сохраняется заранее, callback работает
+- ИСПРАВЛЕНО сравнение clear_deadline (datetime вместо строк)
+- Добавлен метод get_pending_clear_deadlines() для поиска по всем символам
 """
 
-BOT_VERSION = "5.43.0 (27.09.2026)"
+BOT_VERSION = "5.44.0 (28.09.2026)"
 
 import os
 import sys
@@ -53,7 +51,7 @@ init(autoreset=True)
 load_dotenv()
 
 # =============================================================================
-#                       НАСТРОЙКИ БОТА (РЕДАКТИРУЙТЕ ЗДЕСЬ)
+#                       НАСТРОЙКИ БОТА
 # =============================================================================
 DEFAULT_SYMBOL = "ETHUSDT"
 POPULAR_SYMBOLS = ["ETHUSDT", "GRAMUSDT", "XRPUSDT", "BTCUSDT"]
@@ -84,6 +82,7 @@ BYBIT_TESTNET_DEFAULT = False
 SELL_MONITOR_INTERVAL = 30
 BALANCE_CHECK_THRESHOLD = 0.01
 AUTO_CLEAR_DELAY_HOURS = 3
+AUTO_CLEAR_CHECK_INTERVAL_SECONDS = 600  # 10 минут
 # =============================================================================
 
 # ======================== БЕЗОПАСНАЯ ОТПРАВКА СООБЩЕНИЙ ============================
@@ -458,6 +457,46 @@ class Database:
             return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error getting all completed sells: {e}")
+            return []
+
+    # --------- НОВЫЙ МЕТОД: поиск всех просроченных дедлайнов очистки ----------
+    def get_pending_clear_deadlines(self) -> List[Dict]:
+        """
+        Возвращает список продаж, у которых:
+        - notified = 1 (уведомление отправлено)
+        - stats_cleared = 0 (статистика ещё не очищена)
+        - clear_deadline IS NOT NULL и уже наступил
+        По ВСЕМ символам.
+        """
+        try:
+            conn = sqlite3.connect(self.db_file, timeout=5)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            now = get_moscow_time_naive()
+            cursor.execute('''SELECT id, symbol, clear_deadline FROM completed_sells
+                WHERE notified = 1 AND stats_cleared = 0
+                  AND clear_deadline IS NOT NULL''')
+            rows = cursor.fetchall()
+            conn.close()
+            result = []
+            for row in rows:
+                try:
+                    deadline_str = row['clear_deadline']
+                    if isinstance(deadline_str, str):
+                        # поддерживаем оба формата: с 'T' и с пробелом
+                        try:
+                            deadline = datetime.fromisoformat(deadline_str)
+                        except ValueError:
+                            deadline = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M:%S")
+                    else:
+                        deadline = deadline_str
+                    if deadline <= now:
+                        result.append({'id': row['id'], 'symbol': row['symbol'], 'deadline': deadline})
+                except Exception as e:
+                    logger.error(f"Error parsing deadline for sell {row['id']}: {e}")
+            return result
+        except Exception as e:
+            logger.error(f"Error getting pending clear deadlines: {e}")
             return []
 
     def get_check_start_date(self, symbol: str = None) -> Tuple[datetime, str]:
@@ -1503,6 +1542,7 @@ class BybitClient:
         self._order_update_callback = None
         self._ws_thread = None
         self._ws_stop_event = threading.Event()
+        self._main_loop = None  # <-- сохраняем loop заранее
 
     def _init_session(self):
         try:
@@ -1569,19 +1609,11 @@ class BybitClient:
         return {'retCode': -1, 'retMsg': 'Ретраи исчерпаны', 'result': {}}
 
     # =====================================================================
-    #   ИСПРАВЛЕННЫЙ МЕТОД ЗАПУСКА WEBSOCKET
-    #   Проблема: pybit.order_stream() — синхронный блокирующий метод.
-    #   Решение: запускаем его в отдельном потоке через asyncio.to_thread().
+    #   ИСПРАВЛЕННЫЙ ЗАПУСК WEBSOCKET
+    #   1) loop сохраняется ДО запуска потока (self._main_loop)
+    #   2) в callback используется run_coroutine_threadsafe с этим loop
     # =====================================================================
     async def start_websocket(self, callback, symbol: str):
-        """
-        Запускает WebSocket для отслеживания обновлений ордеров.
-
-        ВАЖНО: pybit использует синхронную библиотеку websocket-client,
-        поэтому order_stream() — блокирующий вызов. Запускаем его в
-        отдельном потоке через asyncio.to_thread(), чтобы не блокировать
-        event loop бота.
-        """
         if self.ws_running:
             logger.info("WebSocket already running")
             return
@@ -1589,12 +1621,14 @@ class BybitClient:
         self._order_update_callback = callback
         self._ws_stop_event.clear()
 
+        # ---- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: сохраняем loop ЗАРАНЕЕ ----
+        self._main_loop = asyncio.get_running_loop()
+        logger.info(f"WebSocket: main event loop saved: {id(self._main_loop)}")
+
         fail_count = 0
         last_error_log = 0.0
-        loop = asyncio.get_running_loop()
 
         while not self._ws_stop_event.is_set():
-            # Перед созданием нового сокета закрываем старый
             if self.ws:
                 try:
                     self.ws.exit()
@@ -1616,11 +1650,7 @@ class BybitClient:
                 logger.info(f"WebSocket created, starting order_stream in thread...")
                 fail_count = 0
 
-                # ---- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ----
-                # order_stream() блокирует поток. Запускаем его в отдельном
-                # потоке через asyncio.to_thread(), чтобы не блокировать loop.
-                # Внутри потока pybit сам обрабатывает callback-и в event loop
-                # через asyncio.run_coroutine_threadsafe (мы должны это учесть).
+                # order_stream блокирует поток — запускаем в отдельном
                 await asyncio.to_thread(self._run_order_stream_sync, symbol)
 
                 logger.info("order_stream thread exited normally")
@@ -1648,7 +1678,6 @@ class BybitClient:
             if self._ws_stop_event.is_set():
                 break
 
-            # Реконнект с плавным ростом паузы
             delay = min(60 * (2 ** min(max(fail_count - 1, 0), 2)), 300) + random.uniform(0, 30)
             logger.info(f"WebSocket reconnect in {delay:.0f}s...")
             try:
@@ -1658,22 +1687,16 @@ class BybitClient:
 
     def _run_order_stream_sync(self, symbol: str):
         """
-        Синхронный метод, который запускается в отдельном потоке.
-        Здесь вызывается блокирующий order_stream() из pybit.
-
-        Callback-и из pybit будут вызываться в этом же потоке. Чтобы
-        передать их в asyncio event loop, используем
-        asyncio.run_coroutine_threadsafe.
+        Синхронный метод в отдельном потоке.
+        callback из pybit вызывается в ЭТОМ же потоке — передаём в main loop.
         """
         try:
-            loop = self._get_main_loop()
-            if loop is None:
-                logger.error("Main event loop not found, WebSocket callback will not work")
+            loop = self._main_loop
+            if loop is None or not loop.is_running():
+                logger.error("Main event loop not available, WebSocket callback will not work")
                 return
 
             def sync_callback(message):
-                # pybit вызывает этот callback в потоке order_stream.
-                # Нам нужно передать управление в основной asyncio loop.
                 try:
                     if self._order_update_callback and loop.is_running():
                         asyncio.run_coroutine_threadsafe(
@@ -1689,15 +1712,7 @@ class BybitClient:
             logger.error(f"_run_order_stream_sync error: {e}")
             raise
 
-    def _get_main_loop(self):
-        """Возвращает основной asyncio event loop."""
-        try:
-            return asyncio.get_event_loop()
-        except RuntimeError:
-            return None
-
     async def _handle_order_update_async(self, message):
-        """Асинхронная обёртка для обработки сообщения."""
         try:
             if 'data' not in message:
                 return
@@ -1740,7 +1755,6 @@ class BybitClient:
             except Exception:
                 pass
         self.ws = None
-        # Даём потоку время завершиться
         await asyncio.sleep(1)
         logger.info("WebSocket stopped")
 
@@ -3068,33 +3082,57 @@ class DCAStrategy:
 
         return our_completed
 
-    async def auto_clear_expired_stats(self, symbol: str):
-        """Автоматическая очистка статистики по истечении дедлайна."""
-        conn = sqlite3.connect(self.db.db_file, timeout=5)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        now = get_moscow_time_naive()
+    # ------------------------------------------------------------------
+    #   ИСПРАВЛЕННАЯ АВТООЧИСТКА: работает по всем символам, сравнивает datetime
+    # ------------------------------------------------------------------
+    async def auto_clear_expired_stats(self, symbol: str = None):
+        """
+        Очищает статистику DCA для всех продаж, у которых наступил clear_deadline
+        и статистика ещё не очищена.
 
-        cursor.execute('''SELECT id, symbol FROM completed_sells
-            WHERE notified = 1 AND stats_cleared = 0 AND clear_deadline IS NOT NULL AND clear_deadline <= ?''',
-            (now.isoformat(),))
-        expired = cursor.fetchall()
-        conn.close()
+        Если symbol указан — обрабатываем только его (для обратной совместимости),
+        но по умолчанию — по ВСЕМ символам.
+        """
+        try:
+            if symbol is not None:
+                # Совместимость: ищем просроченные только по этому символу
+                pending = [p for p in self.db.get_pending_clear_deadlines() if p['symbol'] == symbol]
+            else:
+                pending = self.db.get_pending_clear_deadlines()
 
-        user_id = self.db.get_authorized_user_id()
-        for sell in expired:
-            sell_id = sell['id']
-            sym = sell['symbol']
-            deleted = self.db.clear_all_purchases(sym)
-            if deleted > 0:
-                self.db.mark_completed_sell_stats_cleared(sell_id)
-                if user_id and self.bot:
-                    msg = (f"🔄 *Автоматическая очистка статистики*\n"
-                           f"🪙 Токен: `{sym}`\n"
-                           f"🗑 Удалено покупок: `{deleted}`\n"
-                           f"⏰ Прошло более {AUTO_CLEAR_DELAY_HOURS} часов с момента продажи\n"
-                           f"📊 Начинаем новый цикл накопления.")
-                    await safe_send_message(self.bot, user_id, msg, parse_mode='Markdown')
+            if not pending:
+                return
+
+            user_id = self.db.get_authorized_user_id()
+            for item in pending:
+                sell_id = item['id']
+                sym = item['symbol']
+                # Ещё раз перепроверяем, что не очищено (могли очистить параллельно)
+                conn = sqlite3.connect(self.db.db_file, timeout=5)
+                cursor = conn.cursor()
+                cursor.execute('SELECT stats_cleared FROM completed_sells WHERE id = ?', (sell_id,))
+                row = cursor.fetchone()
+                conn.close()
+                if not row or row[0] == 1:
+                    continue
+
+                deleted = self.db.clear_all_purchases(sym)
+                if deleted > 0:
+                    self.db.mark_completed_sell_stats_cleared(sell_id)
+                    logger.info(f"[AUTO-CLEAR] Cleared stats for {sym} (sell_id={sell_id}), deleted {deleted} purchases")
+                    if user_id and self.bot:
+                        msg = (f"🔄 *Автоматическая очистка статистики*\n"
+                               f"🪙 Токен: `{sym}`\n"
+                               f"🗑 Удалено покупок: `{deleted}`\n"
+                               f"⏰ Прошло более {AUTO_CLEAR_DELAY_HOURS} часов с момента продажи\n"
+                               f"📊 Начинаем новый цикл накопления.")
+                        await safe_send_message(self.bot, user_id, msg, parse_mode='Markdown')
+                else:
+                    # Нечего удалять — помечаем как очищенное, чтобы не зацикливаться
+                    self.db.mark_completed_sell_stats_cleared(sell_id)
+                    logger.info(f"[AUTO-CLEAR] Nothing to clear for {sym} (sell_id={sell_id}), marked as cleared")
+        except Exception as e:
+            logger.error(f"Error in auto_clear_expired_stats: {e}")
 
     async def get_recommended_purchase(self, symbol: str) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
@@ -3751,7 +3789,8 @@ class FastDCABot:
             f"🌐 Доступ к бирже Bybit по API ключу {status_emoji}\n"
             f"📋 Уведомления об исполненных ордерах будут приходить сюда.\n"
             f"🔄 WebSocket для мгновенных уведомлений о продажах активен (с fallback на polling).\n"
-            f"🔄 Проверка API выполняется каждые 6 часов."
+            f"🔄 Проверка API выполняется каждые 6 часов.\n"
+            f"🧹 Автоочистка статистики: каждые 10 минут."
         )
         await safe_send_message(self.application.bot, update.effective_user.id, start_message,
                                 parse_mode='Markdown', reply_markup=self.get_main_keyboard())
@@ -5103,6 +5142,7 @@ class FastDCABot:
         message += f"🔔 Уведомления о покупке: {'✅ Вкл' if purchase_notify else '⏹ Выкл'} ({purchase_notify_time} МСК)\n"
         message += f"🕐 Текущее время (МСК): `{current_time.strftime('%H:%M')}`\n"
         message += f"🕐 Интервал проверки: `{order_interval}` мин\n"
+        message += f"🧹 Автоочистка: каждые `{AUTO_CLEAR_CHECK_INTERVAL_SECONDS // 60}` мин (задержка {AUTO_CLEAR_DELAY_HOURS} ч)\n"
         if first_order_date:
             message += f"📅 Первый ордер: `{first_order_date.strftime('%d.%m.%Y %H:%M')}`\n"
         if last_sell_date:
@@ -5783,13 +5823,31 @@ class FastDCABot:
 
                     current_symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                     await self.strategy.check_and_update_sell_orders(current_symbol)
-                    if self.authorized_user_id:
-                        await self.strategy.auto_clear_expired_stats(current_symbol)
+                    # Автоочистка теперь работает и здесь, и в отдельном цикле
+                    await self.strategy.auto_clear_expired_stats()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"DCA scheduler error: {e}")
+                await asyncio.sleep(60)
+
+    # =====================================================================
+    #   НОВЫЙ ЦИКЛ: АВТООЧИСТКА СТАТИСТИКИ
+    #   Проверяет все символы каждые AUTO_CLEAR_CHECK_INTERVAL_SECONDS секунд
+    # =====================================================================
+    async def auto_clear_loop(self):
+        logger.info(f"Auto-clear loop started (interval: {AUTO_CLEAR_CHECK_INTERVAL_SECONDS}s, delay: {AUTO_CLEAR_DELAY_HOURS}h)")
+        await asyncio.sleep(60)  # даём боту инициализироваться
+        while self.scheduler_running:
+            try:
+                if self.strategy:
+                    await self.strategy.auto_clear_expired_stats()
+                await asyncio.sleep(AUTO_CLEAR_CHECK_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Auto-clear loop error: {e}")
                 await asyncio.sleep(60)
 
     async def order_checker_loop(self):
@@ -5990,7 +6048,8 @@ class FastDCABot:
             if stats and stats['total_quantity'] > 0:
                 await self.strategy.check_and_create_sell_order(symbol, silent=False)
         else:
-            await query.edit_message_text(f"❌ Ошибка при очистке статистики для {symbol}", parse_mode='Markdown')
+            self.db.mark_completed_sell_stats_cleared(sell_id)
+            await query.edit_message_text(f"ℹ️ Статистика для {symbol} уже пуста. Отмечено как очищенное.", parse_mode='Markdown')
 
     async def skip_clear_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str, sell_id: int):
         query = update.callback_query
@@ -6076,6 +6135,7 @@ class FastDCABot:
             await self.check_api_and_notify(is_startup=True)
         tasks = [
             asyncio.create_task(self.dca_scheduler_loop()),
+            asyncio.create_task(self.auto_clear_loop()),  # <-- НОВЫЙ ЦИКЛ
             asyncio.create_task(self.order_checker_loop()),
             asyncio.create_task(self.sell_checker_loop()),
             asyncio.create_task(self.pending_sell_checker_loop()),
@@ -6310,10 +6370,11 @@ class FastDCABot:
         print(f"{Fore.WHITE}🌐 Testnet (из .env): {'Да' if BYBIT_TESTNET_DEFAULT else 'Нет'}")
         print(f"{Fore.WHITE}💾 База данных: dca_bot.db (данные сохраняются)")
         print(f"{Fore.WHITE}🕐 Московское время: {get_moscow_time().strftime('%H:%M')}")
-        print(f"{Fore.CYAN}🔌 WebSocket: ВКЛЮЧЕН (исправлен — через отдельный поток)")
+        print(f"{Fore.CYAN}🔌 WebSocket: ВКЛЮЧЕН (loop сохраняется заранее)")
         print(f"{Fore.CYAN}⏱ Интервал мониторинга ордера: {SELL_MONITOR_INTERVAL} сек")
         print(f"{Fore.CYAN}📊 Порог остатка монет для очистки: {BALANCE_CHECK_THRESHOLD}")
         print(f"{Fore.CYAN}⏰ Задержка автоматической очистки: {AUTO_CLEAR_DELAY_HOURS} часа")
+        print(f"{Fore.CYAN}🧹 Проверка автоочистки: каждые {AUTO_CLEAR_CHECK_INTERVAL_SECONDS // 60} мин")
         print(f"{Fore.CYAN}{'='*60}\n")
         self.application.post_init = self.post_init
         self.application.shutdown = self.shutdown
